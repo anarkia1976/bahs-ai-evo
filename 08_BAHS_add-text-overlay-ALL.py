@@ -30,7 +30,7 @@ REEL_LOGO_MARGIN_Y = 48
 
 DEFAULT_TOP_TEXT = "HIGHLIGHTS"
 DEFAULT_SUB_TEXT = "CAMPIONATO - TEAM vs TEAM"
-TEXT_DISPLAY_DURATION_SEC = 30.0
+TEXT_DISPLAY_DURATION_SEC = 15.0
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -368,7 +368,7 @@ def build_cmd_1080p(
     dynamic_y = line_y + 24
     line_width = 750
 
-    trans_time = 1.5
+    trans_time = min(1.5, duration_sec / 3.0)
     start_x = -1600
     target_x = base_x
     hold_end = max(trans_time, duration_sec - trans_time)
@@ -410,6 +410,7 @@ def build_cmd_1080p(
 
     cmd = [
         "ffmpeg",
+        "-loglevel", "error",
         "-i", str(in_video),
         "-filter_complex", filter_complex,
         "-map", "[v_final]",
@@ -448,25 +449,23 @@ def build_cmd_reel(
     safe_top_text = escape_drawtext(top_text)
     safe_dynamic_text = escape_drawtext(dynamic_text)
 
-    _, logo_scaled_h = get_logo_dimensions(extra_dir, REEL_LOGO_WIDTH)
-    logo_top_y = REEL_HEIGHT - REEL_LOGO_MARGIN_Y - logo_scaled_h
-    logo_center_y = int(round(logo_top_y + (logo_scaled_h / 2.0)))
-
-    base_x = 40
+    # Posizione REEL ulteriormente abbassata (line_y = 1380 su 1920, ~71.9% altezza)
+    # con margine residuo sopra la zona comandi/didascalia in basso.
+    base_x = 48
     line_height = 5
-    line_y = logo_center_y - (line_height // 2)
+    line_y = 1380
     base_y = line_y - 70
     dynamic_y = line_y + 22
-    line_width = 760
+    line_width = 720
 
-    trans_time = 1.2
+    trans_time = min(1.2, duration / 3.0)
     start_x = -1120
     target_x = base_x
     hold_end = max(trans_time, duration - trans_time)
 
     logger.info(
-        f"[{SCRIPT_NAME}] Linea verde allineata al centro del logo REEL: "
-        f"logo_center_y={logo_center_y}, line_y={line_y}, base_y={base_y}, dynamic_y={dynamic_y} | "
+        f"[{SCRIPT_NAME}] Testo REEL (durata {duration}s): "
+        f"line_y={line_y}, base_y={base_y}, dynamic_y={dynamic_y}, line_width={line_width} | "
         f"top_text='{top_text}' | dynamic_text='{dynamic_text}' | end_sec={duration}"
     )
 
@@ -489,18 +488,24 @@ def build_cmd_reel(
         f"pad={REEL_WIDTH}:{REEL_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
         f"setsar=1,format=yuv420p[v_norm];"
         f"[v_norm]drawtext={font_clause}text='{safe_top_text}':"
-        f"fontcolor=white:fontsize=58:borderw=3:bordercolor=black@0.85:"
+        f"fontcolor=white:fontsize=56:borderw=3:bordercolor=black@0.85:"
         f"x={base_x}:y={base_y}:alpha='{alpha_expr}':"
         f"enable='between(t,0,{duration})'[txt_top];"
         f"[txt_top]drawbox=x={base_x}:y={line_y}:w={line_width}:h={line_height}:color=0x00FF66:t=fill:"
         f"enable='between(t,0,{duration})'[line_green];"
         f"[line_green]drawtext={font_clause}text='{safe_dynamic_text}':"
-        f"fontcolor=white:fontsize=46:borderw=3:bordercolor=black@0.85:"
+        f"fontcolor=white:fontsize=44:borderw=3:bordercolor=black@0.85:"
         f"x='{x_expr}':y={dynamic_y}:alpha='{alpha_expr}':"
         f"enable='between(t,0,{duration})'[v_final]"
     )
 
-    cmd = ["ffmpeg", "-i", str(in_video), "-filter_complex", filter_complex, "-map", "[v_final]"]
+    cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-i", str(in_video),
+        "-filter_complex", filter_complex,
+        "-map", "[v_final]",
+    ]
     if has_audio(in_video):
         cmd.extend(["-map", "0:a?", "-c:a", "aac", "-b:a", "192k"])
     cmd.extend([
@@ -593,7 +598,7 @@ def main():
         logger.info(f"[{SCRIPT_NAME}] Copiato '{font_path.name}' in TMP come '{tmp_font.name}'.")
 
     total_ms = get_duration_ms(in_video)
-    overlay_end_sec = TEXT_DISPLAY_DURATION_SEC
+    overlay_end_sec = float(args.duration) if args.duration and args.duration > 0 else TEXT_DISPLAY_DURATION_SEC
 
     if fmt_slug == "REEL":
         cmd = build_cmd_reel(
@@ -630,7 +635,7 @@ def main():
             t_err.start()
 
         last_ms = 0
-        with tqdm(total=max(1, total_ms), desc=bar_desc, unit="ms", unit_scale=True, colour=bar_col, ncols=78) as bar:
+        with tqdm(total=max(1, total_ms), desc=bar_desc, unit="ms", unit_scale=True, colour=bar_col, dynamic_ncols=True) as bar:
             if proc.stdout:
                 for raw in iter(proc.stdout.readline, ""):
                     line = raw.strip()
