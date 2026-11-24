@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import math
 import ctypes
 import shutil
 import logging
@@ -429,19 +430,79 @@ def fill_gaps(centers_x: list[float | None], fallback_x: float, max_gap: int = 3
     return out
 
 
-def smooth_ball_track(vals: list[float], base_alpha: float = 0.25, lead_px: float = 0.0) -> list[float]:
+def _gaussian_smooth_1d(vals: list[float], sigma_frames: float) -> list[float]:
+    n = len(vals)
+    if n <= 2 or sigma_frames <= 0.0:
+        return list(vals)
+
+    radius = max(1, int(math.ceil(sigma_frames * 2.5)))
+    weights = [
+        math.exp(-0.5 * (k / sigma_frames) ** 2)
+        for k in range(-radius, radius + 1)
+    ]
+
+    out = [0.0] * n
+    for i in range(n):
+        acc = 0.0
+        w_sum = 0.0
+        lo = max(0, i - radius)
+        hi = min(n - 1, i + radius)
+        for j in range(lo, hi + 1):
+            w = weights[j - i + radius]
+            acc += vals[j] * w
+            w_sum += w
+        out[i] = acc / w_sum if w_sum > 0 else vals[i]
+    return out
+
+
+def smooth_camera_track(
+    vals: list[float],
+    fps: float,
+    crop_w: int,
+    smooth_seconds: float = 0.45,
+    deadzone_ratio: float = 0.07,
+    max_pan_widths_per_sec: float = 0.85,
+) -> list[float]:
+    """
+    Rende il movimento della telecamera fluido e naturale:
+    1) Smoothing gaussiano bidirezionale calibrato sugli FPS.
+    2) Deadzone proporzionale alla larghezza del crop per evitare micro-oscillazioni.
+    3) Limite di velocità e accelerazione per transizioni progressive destra/sinistra.
+    """
     if not vals:
         return []
-    sm = [vals[0]]
-    prev_v = vals[0]
-    for v in vals[1:]:
-        vel = v - prev_v
-        prev_v = v
-        speed_boost = min(0.35, abs(vel) / 120.0)
-        alpha = min(0.65, max(0.05, base_alpha + speed_boost))
-        target = v + (vel * lead_px if lead_px != 0.0 else 0.0)
-        sm.append(alpha * target + (1.0 - alpha) * sm[-1])
-    return sm
+    if len(vals) == 1:
+        return [vals[0]]
+
+    safe_fps = fps if fps and fps > 1.0 else 30.0
+    sigma_frames = max(1.0, smooth_seconds * safe_fps * 0.5)
+    target_track = _gaussian_smooth_1d(vals, sigma_frames=sigma_frames)
+
+    deadzone_px = max(4.0, crop_w * deadzone_ratio)
+    max_step_px = max(1.0, (crop_w * max_pan_widths_per_sec) / safe_fps)
+
+    cam_x = [target_track[0]]
+    cur_x = target_track[0]
+    cur_vel = 0.0
+
+    for target in target_track[1:]:
+        diff = target - cur_x
+        abs_diff = abs(diff)
+
+        if abs_diff <= deadzone_px:
+            desired_x = cur_x + diff * 0.15
+        else:
+            sign = 1.0 if diff > 0 else -1.0
+            effective_diff = diff - sign * deadzone_px
+            desired_x = cur_x + sign * deadzone_px + effective_diff * 0.65
+
+        desired_step = desired_x - cur_x
+        clamped_step = max(-max_step_px, min(max_step_px, desired_step))
+        cur_vel = 0.75 * cur_vel + 0.25 * clamped_step
+        cur_x += cur_vel
+        cam_x.append(cur_x)
+
+    return cam_x
 
 
 def _release_cuda_cache(device_str: str):
@@ -618,23 +679,31 @@ def convert_single_clip(
     max_conf = max(match_confs) if match_confs else 0.0
     min_conf = min(match_confs) if match_confs else 0.0
 
+    crop_w = min(src_w, int(round(src_h * (out_w / out_h))))
+    crop_h = src_h
+    half_w = crop_w / 2.0
+
     initial_x = raw_x[0] if (raw_x and raw_x[0] is not None) else (
         next((v for v in raw_x if v is not None), src_w / 2.0)
     )
     filled_x = fill_gaps(raw_x, fallback_x=initial_x, max_gap=gap_frames)
-    smooth_x = smooth_ball_track(filled_x, base_alpha=alpha, lead_px=0.25)
+    smooth_seconds = max(0.20, min(1.20, alpha * 1.8))
+    smooth_x = smooth_camera_track(
+        filled_x,
+        fps=fps,
+        crop_w=crop_w,
+        smooth_seconds=smooth_seconds,
+        deadzone_ratio=0.07,
+        max_pan_widths_per_sec=0.85,
+    )
 
     logger.info(
         f"[{SCRIPT_NAME}][YOLO-STATS] clip='{input_path.name}' | model='{model_path.name}' | "
         f"device='{active_device}' | frames={analyzed_frames}/{total_frames} | "
         f"matches={matched_frames} ({match_ratio:.1f}%) | no_match={unmatched_frames} | "
         f"ball_boxes={total_boxes_ball} | conf_avg={avg_conf:.3f} "
-        f"(min={min_conf:.3f}, max={max_conf:.3f}) | alpha={alpha} | gap_max={gap_frames}"
+        f"(min={min_conf:.3f}, max={max_conf:.3f}) | alpha={alpha} | smooth_s={smooth_seconds:.2f} | gap_max={gap_frames}"
     )
-
-    crop_w = min(src_w, int(round(src_h * (out_w / out_h))))
-    crop_h = src_h
-    half_w = crop_w / 2.0
 
     tmp_silent = tmp_dir / f"{input_path.stem}_silent.mp4"
     tmp_mux = tmp_dir / f"{input_path.stem}_reel_mux.mp4"
@@ -708,7 +777,7 @@ def main():
     parser.add_argument("--formato", default="REEL")
     parser.add_argument("--model", default="yolo26l.pt")
     parser.add_argument("--device", default="auto", help="Dispositivo YOLO: auto, cpu, cuda:0, 0,1, cuda:0,cuda:1...")
-    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--conf", type=float, default=0.50)
     parser.add_argument("--alpha", type=float, default=0.25)
     parser.add_argument("--gap-frames", type=int, default=35)
     parser.add_argument("--auto", action="store_true")
