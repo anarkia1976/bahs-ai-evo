@@ -5,10 +5,13 @@ import ctypes
 import shutil
 import logging
 import argparse
+import warnings
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 import cv2
+import torch
 from tqdm import tqdm
 from ultralytics import YOLO
 
@@ -106,6 +109,136 @@ def calcola_risorse() -> dict:
     }
 
 
+def _parse_device_token(tok: str, cuda_count: int) -> str | None:
+    t = tok.strip().lower()
+    if not t:
+        return None
+    if t == "cpu":
+        return "cpu"
+    if t.isdigit():
+        idx = int(t)
+        return f"cuda:{idx}" if 0 <= idx < cuda_count else None
+    if t == "cuda":
+        return "cuda:0" if cuda_count > 0 else None
+    if t.startswith("cuda:"):
+        tail = t.split(":", 1)[1].strip()
+        if tail.isdigit():
+            idx = int(tail)
+            return f"cuda:{idx}" if 0 <= idx < cuda_count else None
+        return t if cuda_count > 0 else None
+    return None
+
+
+def rileva_gpu(requested_device: str, logger: logging.Logger) -> dict:
+    req = (requested_device or "auto").strip().lower()
+    cuda_available = False
+    cuda_count = 0
+    devices_detail: list[dict] = []
+
+    try:
+        cuda_available = bool(torch.cuda.is_available())
+        cuda_count = int(torch.cuda.device_count()) if cuda_available else 0
+    except Exception as e:
+        logger.warning(f"[{SCRIPT_NAME}][GPU] Errore verifica CUDA: {e}")
+        cuda_available = False
+        cuda_count = 0
+
+    for idx in range(cuda_count):
+        try:
+            name = torch.cuda.get_device_name(idx)
+        except Exception:
+            name = f"CUDA:{idx}"
+        devices_detail.append({
+            "index": idx,
+            "device": f"cuda:{idx}",
+            "name": name,
+        })
+
+    if devices_detail:
+        desc_gpus = ", ".join(f"cuda:{d['index']} ({d['name']})" for d in devices_detail)
+        logger.info(f"[{SCRIPT_NAME}][GPU] Rilevate {cuda_count} GPU: {desc_gpus}")
+    else:
+        logger.info(f"[{SCRIPT_NAME}][GPU] Nessuna GPU CUDA rilevata.")
+
+    if req == "cpu":
+        selected_devices = ["cpu"]
+    elif req == "auto":
+        if cuda_count > 0:
+            selected_devices = [f"cuda:{idx}" for idx in range(cuda_count)]
+        else:
+            selected_devices = ["cpu"]
+    else:
+        tokens = [tok for tok in req.split(",") if tok.strip()]
+        parsed: list[str] = []
+        for tok in tokens:
+            mapped = _parse_device_token(tok, cuda_count)
+            if mapped and mapped not in parsed:
+                parsed.append(mapped)
+        if not parsed:
+            if req != "cpu":
+                logger.warning(
+                    f"[{SCRIPT_NAME}][GPU] Dispositivo '{requested_device}' non valido o non disponibile -> fallback su 'cpu'."
+                )
+            selected_devices = ["cpu"]
+        else:
+            selected_devices = parsed
+
+    ff_encoder = "libx264"
+    ff_hw_mode = "cpu"
+    use_gpu = any(d.startswith("cuda") for d in selected_devices)
+
+    if use_gpu or req == "auto":
+        try:
+            enc_out = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout or ""
+
+            candidates: list[tuple[str, str]] = []
+            if "h264_nvenc" in enc_out:
+                candidates.append(("h264_nvenc", "nvenc"))
+            if "h264_amf" in enc_out:
+                candidates.append(("h264_amf", "amf"))
+
+            for codec, mode in candidates:
+                test_cmd = [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-f", "lavfi",
+                    "-i", "color=c=black:s=128x128:r=1:d=0.1",
+                    "-c:v", codec,
+                    "-f", "null",
+                    "-",
+                ]
+                proc = subprocess.run(test_cmd, capture_output=True, text=True, check=False)
+                if proc.returncode == 0:
+                    ff_encoder = codec
+                    ff_hw_mode = mode
+                    break
+        except Exception as e:
+            logger.warning(f"[{SCRIPT_NAME}][GPU] Verifica encoder hardware FFmpeg fallita, uso libx264: {e}")
+            ff_encoder = "libx264"
+            ff_hw_mode = "cpu"
+
+    info = {
+        "cuda_available": cuda_available,
+        "cuda_count": cuda_count,
+        "devices_detail": devices_detail,
+        "yolo_devices": selected_devices,
+        "primary_device": selected_devices[0],
+        "ff_encoder": ff_encoder,
+        "ff_hw_mode": ff_hw_mode,
+    }
+    logger.info(
+        f"[{SCRIPT_NAME}][GPU] req='{requested_device}' | count={cuda_count} | "
+        f"devices={selected_devices} | ff_encoder='{ff_encoder}'"
+    )
+    return info
+
+
 def sanitize_slug(text: str) -> str:
     cleaned = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in text.strip())
     while "__" in cleaned:
@@ -185,7 +318,7 @@ def log_model_info(model: YOLO, model_path: Path, logger: logging.Logger):
     )
 
 
-def resolve_model(model_arg: str, model_dir: Path, base_dir: Path, logger: logging.Logger) -> tuple[YOLO, Path]:
+def prepare_model_path(model_arg: str, model_dir: Path, base_dir: Path, logger: logging.Logger) -> Path:
     model_dir.mkdir(parents=True, exist_ok=True)
     p = Path(model_arg)
     norm_name = model_arg if (p.is_file() or p.suffix.lower() in MODEL_EXTS) else f"{model_arg.lower()}.pt"
@@ -193,10 +326,8 @@ def resolve_model(model_arg: str, model_dir: Path, base_dir: Path, logger: loggi
     target = model_dir / model_filename
 
     if target.is_file() and target.stat().st_size > 0:
-        logger.info(f"[{SCRIPT_NAME}][YOLO-MODEL] Caricamento modello locale da '{target}'.")
-        model = YOLO(str(target))
-        log_model_info(model, target, logger)
-        return model, target
+        logger.info(f"[{SCRIPT_NAME}][YOLO-MODEL] Modello locale trovato in '{target}'.")
+        return target
 
     src_candidates = [
         p if p.is_file() else None,
@@ -208,9 +339,7 @@ def resolve_model(model_arg: str, model_dir: Path, base_dir: Path, logger: loggi
         if cand and cand.is_file() and cand.stat().st_size > 0 and cand.resolve() != target.resolve():
             shutil.copy2(cand, target)
             logger.info(f"[{SCRIPT_NAME}][YOLO-MODEL] Copiato modello '{cand}' in '{target}'.")
-            model = YOLO(str(target))
-            log_model_info(model, target, logger)
-            return model, target
+            return target
 
     logger.info(f"[{SCRIPT_NAME}][YOLO-MODEL] Download modello '{model_filename}' in '{model_dir}'...")
 
@@ -230,9 +359,25 @@ def resolve_model(model_arg: str, model_dir: Path, base_dir: Path, logger: loggi
         raise FileNotFoundError(f"Modello '{model_filename}' non disponibile in '{model_dir}' dopo il download.")
 
     logger.info(f"[{SCRIPT_NAME}][YOLO-MODEL] Modello scaricato e pronto in '{target}'.")
-    model = YOLO(str(target))
-    log_model_info(model, target, logger)
-    return model, target
+    return target
+
+
+def load_yolo_for_device(model_path: Path, device: str, logger: logging.Logger) -> tuple[YOLO, str]:
+    try:
+        logger.info(f"[{SCRIPT_NAME}][YOLO-MODEL] Caricamento '{model_path.name}' su '{device}'...")
+        m = YOLO(str(model_path))
+        if device.startswith("cuda") and torch.cuda.is_available():
+            try:
+                m.to(device)
+            except Exception as move_err:
+                logger.warning(f"[{SCRIPT_NAME}][GPU] m.to('{device}') avviso: {move_err}")
+        return m, device
+    except Exception as e:
+        if device != "cpu":
+            logger.warning(f"[{SCRIPT_NAME}][GPU-FALLBACK] Caricamento su '{device}' fallito ({e}), ripiego su 'cpu'.")
+            m = YOLO(str(model_path))
+            return m, "cpu"
+        raise
 
 
 def detect_ball_cls(model: YOLO, logger: logging.Logger) -> tuple[int, str]:
@@ -246,7 +391,7 @@ def detect_ball_cls(model: YOLO, logger: logging.Logger) -> tuple[int, str]:
     return COCO_SPORTS_BALL_CLASS, fallback_lbl
 
 
-def fill_gaps(centers_x: list[float | None], fallback_x: float, max_gap: int = 15) -> list[float]:
+def fill_gaps(centers_x: list[float | None], fallback_x: float, max_gap: int = 35) -> list[float]:
     n = len(centers_x)
     if n == 0:
         return []
@@ -263,11 +408,20 @@ def fill_gaps(centers_x: list[float | None], fallback_x: float, max_gap: int = 1
             continue
         prev_k = max([k for k in known if k < i], default=None)
         next_k = min([k for k in known if k > i], default=None)
+
         if prev_k is not None and next_k is not None and (next_k - prev_k - 1) <= max_gap:
             r = (i - prev_k) / (next_k - prev_k)
             out[i] = (1.0 - r) * float(centers_x[prev_k]) + r * float(centers_x[next_k])  # type: ignore[index]
         elif prev_k is not None:
-            out[i] = float(centers_x[prev_k])  # type: ignore[index]
+            dt = i - prev_k
+            vx = 0.0
+            prev2_k = max([k for k in known if k < prev_k], default=None)
+            if prev2_k is not None and (prev_k - prev2_k) > 0:
+                vx = (float(centers_x[prev_k]) - float(centers_x[prev2_k])) / float(prev_k - prev2_k)  # type: ignore[index]
+            damping = 0.85 ** min(dt, 15)
+            extrap = float(centers_x[prev_k]) + vx * min(dt, 12) * damping  # type: ignore[index]
+            blend = min(1.0, dt / max(1, max_gap))
+            out[i] = (1.0 - blend) * extrap + blend * float(centers_x[prev_k])  # type: ignore[index]
         elif next_k is not None:
             out[i] = float(centers_x[next_k])  # type: ignore[index]
         else:
@@ -275,13 +429,100 @@ def fill_gaps(centers_x: list[float | None], fallback_x: float, max_gap: int = 1
     return out
 
 
-def smooth_ema(vals: list[float], alpha: float = 0.12) -> list[float]:
+def smooth_ball_track(vals: list[float], base_alpha: float = 0.25, lead_px: float = 0.0) -> list[float]:
     if not vals:
         return []
     sm = [vals[0]]
+    prev_v = vals[0]
     for v in vals[1:]:
-        sm.append(alpha * v + (1.0 - alpha) * sm[-1])
+        vel = v - prev_v
+        prev_v = v
+        speed_boost = min(0.35, abs(vel) / 120.0)
+        alpha = min(0.65, max(0.05, base_alpha + speed_boost))
+        target = v + (vel * lead_px if lead_px != 0.0 else 0.0)
+        sm.append(alpha * target + (1.0 - alpha) * sm[-1])
     return sm
+
+
+def _release_cuda_cache(device_str: str):
+    if device_str.startswith("cuda") and torch.cuda.is_available():
+        try:
+            if ":" in device_str:
+                idx = int(device_str.split(":", 1)[1])
+                with torch.cuda.device(idx):
+                    torch.cuda.empty_cache()
+            else:
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def predict_frame_with_fallback(
+    model: YOLO,
+    frame,
+    conf: float,
+    imgsz: int | None,
+    ball_cls_id: int,
+    active_device: str,
+    logger: logging.Logger,
+) -> tuple[list, str]:
+    kwargs = {
+        "conf": conf,
+        "classes": [ball_cls_id],
+        "verbose": False,
+        "device": active_device,
+    }
+    if imgsz:
+        kwargs["imgsz"] = imgsz
+
+    try:
+        return model.predict(frame, **kwargs), active_device
+    except Exception as e:
+        if active_device.startswith("cuda"):
+            _release_cuda_cache(active_device)
+            logger.warning(
+                f"[{SCRIPT_NAME}][GPU-FALLBACK] Errore YOLO su '{active_device}' ({e}), "
+                f"passo definitivamente a 'cpu'."
+            )
+            kwargs["device"] = "cpu"
+            return model.predict(frame, **kwargs), "cpu"
+        raise
+
+
+def build_ffmpeg_mux_cmd(
+    tmp_silent: Path,
+    input_path: Path,
+    tmp_mux: Path,
+    res: dict,
+    encoder: str,
+) -> list[str]:
+    if encoder == "h264_nvenc":
+        v_args = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20", "-pix_fmt", "yuv420p"]
+    elif encoder == "h264_amf":
+        v_args = ["-c:v", "h264_amf", "-quality", "balanced", "-pix_fmt", "yuv420p"]
+    else:
+        v_args = [
+            "-c:v", "libx264",
+            "-preset", res["preset"],
+            "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-threads", str(res["threads"]),
+        ]
+
+    return [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-y",
+        "-i", str(tmp_silent),
+        "-i", str(input_path),
+        "-map", "0:v:0",
+        "-map", "1:a?",
+        *v_args,
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        str(tmp_mux),
+    ]
 
 
 def convert_single_clip(
@@ -297,10 +538,13 @@ def convert_single_clip(
     alpha: float,
     gap_frames: int,
     res: dict,
+    assigned_device: str,
+    ff_encoder: str,
     logger: logging.Logger,
     out_w: int = 1080,
     out_h: int = 1920,
 ) -> dict:
+    active_device = assigned_device
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
         raise RuntimeError(f"Impossibile aprire {input_path}")
@@ -312,36 +556,59 @@ def convert_single_clip(
 
     logger.info(
         f"[{SCRIPT_NAME}][YOLO-TRACK-START] clip='{input_path.name}' | model='{model_path.name}' | "
-        f"cls={ball_cls_id}('{ball_cls_name}') | conf={conf} | imgsz={imgsz or 'native'} | "
-        f"res={src_w}x{src_h}@{fps:.2f}fps | frames_meta={total_frames}"
+        f"device='{active_device}' | cls={ball_cls_id}('{ball_cls_name}') | conf={conf} | "
+        f"imgsz={imgsz or 'native'} | res={src_w}x{src_h}@{fps:.2f}fps | frames_meta={total_frames}"
     )
 
     raw_x: list[float | None] = []
     match_confs: list[float] = []
-    total_boxes_all_classes = 0
+    total_boxes_ball = 0
+    last_known_x: float | None = None
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        results = model.predict(frame, conf=conf, imgsz=imgsz, verbose=False) if imgsz else model.predict(frame, conf=conf, verbose=False)
-        best_x = None
-        best_c = 0.0
-        for r in results:
-            if r.boxes is None:
-                continue
-            total_boxes_all_classes += len(r.boxes)
-            for box in r.boxes:
-                cid = int(box.cls[0].item())
-                c = float(box.conf[0].item())
-                if cid == ball_cls_id and c > best_c:
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            results, active_device = predict_frame_with_fallback(
+                model=model,
+                frame=frame,
+                conf=conf,
+                imgsz=imgsz,
+                ball_cls_id=ball_cls_id,
+                active_device=active_device,
+                logger=logger,
+            )
+            best_x = None
+            best_score = -1.0
+            best_c = 0.0
+            for r in results:
+                if r.boxes is None:
+                    continue
+                for box in r.boxes:
+                    cid = int(box.cls[0].item())
+                    if cid != ball_cls_id:
+                        continue
+                    total_boxes_ball += 1
+                    c = float(box.conf[0].item())
                     x1, _, x2, _ = box.xyxy[0].tolist()
-                    best_x = (x1 + x2) / 2.0
-                    best_c = c
-        if best_x is not None:
-            match_confs.append(best_c)
-        raw_x.append(best_x)
-    cap.release()
+                    cx_cand = (x1 + x2) / 2.0
+                    if last_known_x is not None:
+                        dist_norm = abs(cx_cand - last_known_x) / max(1.0, float(src_w))
+                        score = c - (0.18 * dist_norm)
+                    else:
+                        score = c
+                    if score > best_score:
+                        best_score = score
+                        best_x = cx_cand
+                        best_c = c
+            if best_x is not None:
+                match_confs.append(best_c)
+                last_known_x = best_x
+            raw_x.append(best_x)
+    finally:
+        cap.release()
+        _release_cuda_cache(active_device)
 
     analyzed_frames = len(raw_x)
     matched_frames = len(match_confs)
@@ -351,14 +618,18 @@ def convert_single_clip(
     max_conf = max(match_confs) if match_confs else 0.0
     min_conf = min(match_confs) if match_confs else 0.0
 
-    filled_x = fill_gaps(raw_x, fallback_x=src_w / 2.0, max_gap=gap_frames)
-    smooth_x = smooth_ema(filled_x, alpha=alpha)
+    initial_x = raw_x[0] if (raw_x and raw_x[0] is not None) else (
+        next((v for v in raw_x if v is not None), src_w / 2.0)
+    )
+    filled_x = fill_gaps(raw_x, fallback_x=initial_x, max_gap=gap_frames)
+    smooth_x = smooth_ball_track(filled_x, base_alpha=alpha, lead_px=0.25)
 
     logger.info(
         f"[{SCRIPT_NAME}][YOLO-STATS] clip='{input_path.name}' | model='{model_path.name}' | "
-        f"frames={analyzed_frames}/{total_frames} | matches={matched_frames} ({match_ratio:.1f}%) | "
-        f"no_match={unmatched_frames} | boxes_tot={total_boxes_all_classes} | "
-        f"conf_avg={avg_conf:.3f} (min={min_conf:.3f}, max={max_conf:.3f}) | alpha={alpha} | gap_max={gap_frames}"
+        f"device='{active_device}' | frames={analyzed_frames}/{total_frames} | "
+        f"matches={matched_frames} ({match_ratio:.1f}%) | no_match={unmatched_frames} | "
+        f"ball_boxes={total_boxes_ball} | conf_avg={avg_conf:.3f} "
+        f"(min={min_conf:.3f}, max={max_conf:.3f}) | alpha={alpha} | gap_max={gap_frames}"
     )
 
     crop_w = min(src_w, int(round(src_h * (out_w / out_h))))
@@ -373,39 +644,36 @@ def convert_single_clip(
     writer = cv2.VideoWriter(str(tmp_silent), fourcc, fps, (out_w, out_h))
 
     idx = 0
-    while True:
-        ret, frame = cap2.read()
-        if not ret:
-            break
-        cx = smooth_x[idx] if idx < len(smooth_x) else src_w / 2.0
-        x1 = max(0, min(int(round(cx - half_w)), src_w - crop_w))
-        cropped = frame[0:crop_h, x1:x1 + crop_w]
-        resized = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
-        writer.write(resized)
-        idx += 1
+    try:
+        while True:
+            ret, frame = cap2.read()
+            if not ret:
+                break
+            cx = smooth_x[idx] if idx < len(smooth_x) else initial_x
+            x1 = max(0, min(int(round(cx - half_w)), src_w - crop_w))
+            cropped = frame[0:crop_h, x1:x1 + crop_w]
+            resized = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+            writer.write(resized)
+            idx += 1
+    finally:
+        cap2.release()
+        writer.release()
 
-    cap2.release()
-    writer.release()
-
-    cmd = [
-        "ffmpeg",
-        "-loglevel", "error",
-        "-y",
-        "-i", str(tmp_silent),
-        "-i", str(input_path),
-        "-map", "0:v:0",
-        "-map", "1:a?",
-        "-c:v", "libx264",
-        "-preset", res["preset"],
-        "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        "-threads", str(res["threads"]),
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-movflags", "+faststart",
-        str(tmp_mux),
-    ]
+    used_encoder = ff_encoder
+    cmd = build_ffmpeg_mux_cmd(tmp_silent, input_path, tmp_mux, res, used_encoder)
     proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    if proc.returncode != 0 and used_encoder != "libx264":
+        logger.warning(
+            f"[{SCRIPT_NAME}][GPU-FALLBACK] Encoder '{used_encoder}' fallito su {input_path.name} "
+            f"(rc={proc.returncode}): {proc.stderr.strip()} -> fallback su 'libx264'."
+        )
+        used_encoder = "libx264"
+        if tmp_mux.exists():
+            tmp_mux.unlink(missing_ok=True)
+        cmd = build_ffmpeg_mux_cmd(tmp_silent, input_path, tmp_mux, res, used_encoder)
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+
     if proc.returncode != 0:
         if tmp_silent.exists():
             tmp_silent.unlink(missing_ok=True)
@@ -416,13 +684,13 @@ def convert_single_clip(
     shutil.move(str(tmp_mux), str(output_path))
     if tmp_silent.exists():
         tmp_silent.unlink()
-    logger.info(f"[{SCRIPT_NAME}] Convertita clip REEL: '{output_path.name}'")
+    logger.info(f"[{SCRIPT_NAME}] Convertita clip REEL ({active_device}, {used_encoder}): '{output_path.name}'")
 
     return {
         "clip": input_path.name,
         "frames": analyzed_frames,
         "matches": matched_frames,
-        "boxes": total_boxes_all_classes,
+        "boxes": total_boxes_ball,
         "conf_sum": sum(match_confs),
         "conf_max": max_conf,
     }
@@ -430,6 +698,8 @@ def convert_single_clip(
 
 def main():
     abilita_ansi()
+    warnings.filterwarnings("ignore", message=".*'half' is deprecated.*", category=UserWarning)
+    logging.getLogger("ultralytics").setLevel(logging.WARNING)
 
     parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Conversione clip in formato REEL 9:16")
     parser.add_argument("--base-dir", default=".")
@@ -437,20 +707,23 @@ def main():
     parser.add_argument("--sottotitolo", default="CAMPIONATO - TEAM vs TEAM")
     parser.add_argument("--formato", default="REEL")
     parser.add_argument("--model", default="yolo26l.pt")
-    parser.add_argument("--conf", type=float, default=0.50)
-    parser.add_argument("--alpha", type=float, default=0.12)
-    parser.add_argument("--gap-frames", type=int, default=15)
+    parser.add_argument("--device", default="auto", help="Dispositivo YOLO: auto, cpu, cuda:0, 0,1, cuda:0,cuda:1...")
+    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--alpha", type=float, default=0.25)
+    parser.add_argument("--gap-frames", type=int, default=35)
     parser.add_argument("--auto", action="store_true")
     args = parser.parse_args()
 
     base_dir = Path(args.base_dir).resolve()
     dirs, logger, log_file = setup_dirs_and_logger(base_dir)
+    gpu_info = rileva_gpu(args.device, logger)
     res = calcola_risorse()
     imgsz = res["imgsz_default"]
     tipo_slug = sanitize_slug(args.tipo)
 
     logger.info(
         f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | model='{args.model}' | "
+        f"devices={gpu_info['yolo_devices']} | ff_encoder='{gpu_info['ff_encoder']}' | "
         f"imgsz={imgsz} | conf={args.conf} | alpha={args.alpha} | gap_frames={args.gap_frames} | "
         f"auto={args.auto} | risorse={res}"
     )
@@ -469,42 +742,64 @@ def main():
     logger.info(f"[{SCRIPT_NAME}] Trovate {len(clips)} clip sorgente: {[c.name for c in clips]}")
 
     try:
-        model, model_path = resolve_model(args.model, dirs["model"], base_dir, logger)
+        model_path = prepare_model_path(args.model, dirs["model"], base_dir, logger)
     except Exception as e:
-        print(f"{RED}[X] [{SCRIPT_NAME}] Impossibile preparare/caricare il modello '{args.model}' in 'EXTRA/MODEL/': {e}{RESET}", file=sys.stderr)
+        print(f"{RED}[X] [{SCRIPT_NAME}] Impossibile preparare il modello '{args.model}' in 'EXTRA/MODEL/': {e}{RESET}", file=sys.stderr)
         logger.exception(f"[{SCRIPT_NAME}] Errore modello '{args.model}': {e}")
         sys.exit(1)
 
-    ball_cls_id, ball_cls_name = detect_ball_cls(model, logger)
-
+    tasks: list[tuple[Path, Path]] = []
     ok_cnt = err_cnt = 0
+    for clip in clips:
+        out_reel = dirs["out"] / build_reel_clip_name(clip, tipo_slug)
+        if out_reel.is_file() and out_reel.stat().st_size > 0 and out_reel.resolve() != clip.resolve():
+            if args.auto:
+                logger.info(f"[{SCRIPT_NAME}][YOLO-STATS] clip='{clip.name}' | stato=SKIP_EXISTING ('{out_reel.name}')")
+                ok_cnt += 1
+                continue
+        tasks.append((clip, out_reel))
+
     tot_frames = tot_matches = tot_boxes = 0
     tot_conf_sum = 0.0
     global_max_conf = 0.0
 
+    worker_devices = gpu_info["yolo_devices"]
+    models_by_dev: dict[str, tuple[YOLO, str]] = {}
+    ball_cls_id = COCO_SPORTS_BALL_CLASS
+    ball_cls_name = "sports ball"
+
+    if tasks:
+        try:
+            for dev in worker_devices:
+                m_inst, actual_dev = load_yolo_for_device(model_path, dev, logger)
+                models_by_dev[dev] = (m_inst, actual_dev)
+            first_model = next(iter(models_by_dev.values()))[0]
+            log_model_info(first_model, model_path, logger)
+            ball_cls_id, ball_cls_name = detect_ball_cls(first_model, logger)
+        except Exception as e:
+            print(f"{RED}[X] [{SCRIPT_NAME}] Impossibile caricare il modello '{model_path.name}': {e}{RESET}", file=sys.stderr)
+            logger.exception(f"[{SCRIPT_NAME}] Errore caricamento modello '{model_path.name}': {e}")
+            sys.exit(1)
+
     with tqdm(
-        clips,
+        total=len(clips),
+        initial=ok_cnt,
         desc="05 | Conversione REEL",
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}{postfix}",
         colour="magenta",
         ncols=82,
     ) as bar:
-        for clip in bar:
-            label = short_clip_name(clip, tipo_slug)
-            bar.postfix = f" - {label}"
-            bar.refresh()
-            out_reel = dirs["out"] / build_reel_clip_name(clip, tipo_slug)
-            if out_reel.is_file() and out_reel.stat().st_size > 0 and out_reel.resolve() != clip.resolve():
-                if args.auto:
-                    logger.info(f"[{SCRIPT_NAME}][YOLO-STATS] clip='{clip.name}' | stato=SKIP_EXISTING ('{out_reel.name}')")
-                    ok_cnt += 1
-                    continue
-            try:
-                st = convert_single_clip(
-                    input_path=clip,
-                    output_path=out_reel,
+        if len(tasks) > 1 and len(worker_devices) > 1:
+            logger.info(f"[{SCRIPT_NAME}][MULTI-GPU] Avvio elaborazione parallela su {len(worker_devices)} dispositivi: {worker_devices}")
+
+            def _run_task(task_idx: int, clip_in: Path, clip_out: Path) -> dict:
+                dev_key = worker_devices[task_idx % len(worker_devices)]
+                m_inst, actual_dev = models_by_dev[dev_key]
+                return convert_single_clip(
+                    input_path=clip_in,
+                    output_path=clip_out,
                     tmp_dir=dirs["tmp"],
-                    model=model,
+                    model=m_inst,
                     model_path=model_path,
                     ball_cls_id=ball_cls_id,
                     ball_cls_name=ball_cls_name,
@@ -513,25 +808,77 @@ def main():
                     alpha=args.alpha,
                     gap_frames=args.gap_frames,
                     res=res,
+                    assigned_device=actual_dev,
+                    ff_encoder=gpu_info["ff_encoder"],
                     logger=logger,
                 )
-                tot_frames += st["frames"]
-                tot_matches += st["matches"]
-                tot_boxes += st["boxes"]
-                tot_conf_sum += st["conf_sum"]
-                if st["conf_max"] > global_max_conf:
-                    global_max_conf = st["conf_max"]
-                ok_cnt += 1
-            except Exception as e:
-                err_cnt += 1
-                logger.exception(f"[{SCRIPT_NAME}] Errore su '{clip.name}': {e}")
-                print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore su '{clip.name}': {e} (log: {log_file.name}){RESET}", file=sys.stderr)
+
+            with ThreadPoolExecutor(max_workers=len(worker_devices)) as pool:
+                futures = {
+                    pool.submit(_run_task, i, c_in, c_out): c_in
+                    for i, (c_in, c_out) in enumerate(tasks)
+                }
+                for fut in as_completed(futures):
+                    clip = futures[fut]
+                    bar.postfix = f" - {short_clip_name(clip, tipo_slug)}"
+                    try:
+                        st = fut.result()
+                        tot_frames += st["frames"]
+                        tot_matches += st["matches"]
+                        tot_boxes += st["boxes"]
+                        tot_conf_sum += st["conf_sum"]
+                        if st["conf_max"] > global_max_conf:
+                            global_max_conf = st["conf_max"]
+                        ok_cnt += 1
+                    except Exception as e:
+                        err_cnt += 1
+                        logger.exception(f"[{SCRIPT_NAME}] Errore su '{clip.name}': {e}")
+                        print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore su '{clip.name}': {e} (log: {log_file.name}){RESET}", file=sys.stderr)
+                    bar.update(1)
+        else:
+            dev_key = worker_devices[0] if worker_devices else "cpu"
+            m_inst, actual_dev = models_by_dev[dev_key] if dev_key in models_by_dev else load_yolo_for_device(model_path, "cpu", logger)
+            for clip, out_reel in tasks:
+                label = short_clip_name(clip, tipo_slug)
+                bar.postfix = f" - {label}"
+                bar.refresh()
+                try:
+                    st = convert_single_clip(
+                        input_path=clip,
+                        output_path=out_reel,
+                        tmp_dir=dirs["tmp"],
+                        model=m_inst,
+                        model_path=model_path,
+                        ball_cls_id=ball_cls_id,
+                        ball_cls_name=ball_cls_name,
+                        conf=args.conf,
+                        imgsz=imgsz,
+                        alpha=args.alpha,
+                        gap_frames=args.gap_frames,
+                        res=res,
+                        assigned_device=actual_dev,
+                        ff_encoder=gpu_info["ff_encoder"],
+                        logger=logger,
+                    )
+                    tot_frames += st["frames"]
+                    tot_matches += st["matches"]
+                    tot_boxes += st["boxes"]
+                    tot_conf_sum += st["conf_sum"]
+                    if st["conf_max"] > global_max_conf:
+                        global_max_conf = st["conf_max"]
+                    ok_cnt += 1
+                except Exception as e:
+                    err_cnt += 1
+                    logger.exception(f"[{SCRIPT_NAME}] Errore su '{clip.name}': {e}")
+                    print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore su '{clip.name}': {e} (log: {log_file.name}){RESET}", file=sys.stderr)
+                bar.update(1)
 
     overall_ratio = (tot_matches / tot_frames * 100.0) if tot_frames > 0 else 0.0
     overall_avg_conf = (tot_conf_sum / tot_matches) if tot_matches > 0 else 0.0
 
     logger.info(
-        f"[{SCRIPT_NAME}][YOLO-SUMMARY] model='{model_path.name}' | clips_ok={ok_cnt}/{len(clips)} | "
+        f"[{SCRIPT_NAME}][YOLO-SUMMARY] model='{model_path.name}' | devices={worker_devices} | "
+        f"ff_encoder='{gpu_info['ff_encoder']}' | clips_ok={ok_cnt}/{len(clips)} | "
         f"clips_err={err_cnt} | total_frames={tot_frames} | total_matches={tot_matches} "
         f"({overall_ratio:.1f}%) | total_boxes={tot_boxes} | avg_conf={overall_avg_conf:.3f} | max_conf={global_max_conf:.3f}"
     )
