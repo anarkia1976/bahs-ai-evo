@@ -1,0 +1,8 @@
+# BAHS - Basketball Automation Highlights Suite
+# Dipendenze Python principali
+opencv-python>=4.8.0
+tqdm>=4.66.0
+ultralytics>=8.3.0
+numpy>=1.24.0
+Pillow>=10.0.0
+psutil>=5.9.0
