@@ -52,10 +52,6 @@ def disabilita_quick_edit_windows():
             pass
 
 
-def pulisci_console():
-    os.system("cls" if os.name == "nt" else "clear")
-
-
 def rileva_ram_gb() -> tuple[float, float]:
     try:
         import psutil  # type: ignore
@@ -181,14 +177,14 @@ def time_to_seconds(time_str: str) -> float:
     return parts[0]
 
 
-def load_timestamps(dir_out: Path, tipo_slug: str, fmt_slug: str) -> list[str] | None:
+def load_timestamps(dir_out: Path, tipo_slug: str, fmt_slug: str) -> tuple[list[str] | None, Path | None]:
     candidates = [
         dir_out / f"{tipo_slug}_{fmt_slug}_timestamps.txt",
         dir_out / "timestamps.txt",
     ]
     txt_path = next((p for p in candidates if p.is_file()), None)
     if not txt_path:
-        return None
+        return None, None
     times: list[str] = []
     for line in txt_path.read_text(encoding="utf-8", errors="ignore").splitlines():
         s = line.strip()
@@ -197,7 +193,7 @@ def load_timestamps(dir_out: Path, tipo_slug: str, fmt_slug: str) -> list[str] |
         for p in s.split(","):
             if p.strip():
                 times.append(p.strip())
-    return times if times else None
+    return (times if times else None), txt_path
 
 
 def trova_clip_esistenti(dir_out: Path, tipo_slug: str, fmt_slug: str) -> list[Path]:
@@ -221,7 +217,6 @@ def risolvi_video_sorgente(dir_out: Path, tipo_slug: str, fmt_slug: str, request
 
 
 def chiedi_tempi_taglio(default_before: float = DEFAULT_BUFFER_BEFORE, default_after: float = DEFAULT_BUFFER_AFTER) -> tuple[float, float]:
-    print(f"\n{CYAN}--- CONFIGURAZIONE TEMPI DI TAGLIO (Default: {default_before:g}s prima / {default_after:g}s dopo) ---{RESET}", flush=True)
     raw_before = input(f"⏱️  Secondi PRIMA del timestamp [INVIO = {default_before:g}]: ").strip().replace(",", ".")
     raw_after = input(f"⏱️  Secondi DOPO il timestamp  [INVIO = {default_after:g}]: ").strip().replace(",", ".")
 
@@ -242,7 +237,7 @@ def chiedi_tempi_taglio(default_before: float = DEFAULT_BUFFER_BEFORE, default_a
     return before_val, after_val
 
 
-def extract_clip(input_video: Path, timestamp: str, out_clip: Path, buffer_before: float, duration: float, res: dict, logger: logging.Logger) -> bool:
+def extract_clip(input_video: Path, timestamp: str, out_clip: Path, buffer_before: float, duration: float, res: dict, logger: logging.Logger) -> tuple[bool, str]:
     center_sec = time_to_seconds(timestamp)
     start_sec = max(0.0, center_sec - buffer_before)
 
@@ -265,16 +260,16 @@ def extract_clip(input_video: Path, timestamp: str, out_clip: Path, buffer_befor
     ]
     proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode == 0 and out_clip.is_file() and out_clip.stat().st_size > 0:
-        logger.info(f"[{SCRIPT_NAME}] Clip creata: {out_clip.name} (ts={timestamp}, start={start_sec:.2f}s, dur={duration:.2f}s)")
-        return True
-    logger.error(f"[{SCRIPT_NAME}] Errore taglio clip {out_clip.name}: {proc.stderr.strip()}")
-    return False
+        logger.info(f"[{SCRIPT_NAME}] Clip creata: '{out_clip.name}' (ts={timestamp}, start={start_sec:.2f}s, dur={duration:.2f}s)")
+        return True, ""
+    err_detail = proc.stderr.strip() or f"returncode={proc.returncode}"
+    logger.error(f"[{SCRIPT_NAME}] Errore taglio clip '{out_clip.name}' (ts={timestamp}, rc={proc.returncode}): {err_detail}")
+    return False, f"{out_clip.name}: {err_detail}"
 
 
 def main():
     abilita_ansi()
     disabilita_quick_edit_windows()
-    pulisci_console()
 
     parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Taglio clip originali dai timestamp")
     parser.add_argument("--base-dir", default=".")
@@ -295,41 +290,39 @@ def main():
     if fmt_slug not in ("1080P", "REEL"):
         fmt_slug = "1080P"
 
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}")
-    print(f" {BOLD}{GREEN}INIZIO: {SCRIPT_NAME}{RESET} | Tipo: {BOLD}{args.tipo}{RESET} | Formato: {BOLD}{fmt_slug}{RESET}")
-    print(
-        f" {YELLOW}[CPU/RAM]{RESET} Thread: {res['threads']} | RAM disp.: {res['ram_avail']}/{res['ram_tot']} GB | "
-        f"Worker: {res['max_workers']} | Thread/Worker: {res['threads_per_worker']} | Preset: {res['preset']}"
+    logger.info(
+        f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | formato='{fmt_slug}' | "
+        f"before={args.before} | after={args.after} | auto={args.auto} | risorse={res}"
     )
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}\n", flush=True)
-    logger.info(f"[{SCRIPT_NAME}] Avvio | tipo={args.tipo} | formato={fmt_slug} | auto={args.auto} | risorse={res}")
 
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        print(f"{RED}[X] FFmpeg o FFprobe non trovati nel PATH.{RESET}", flush=True)
+        print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.")
         sys.exit(1)
 
     existing_clips = trova_clip_esistenti(dirs["out"], tipo_slug, fmt_slug)
     if existing_clips:
-        print(f"{YELLOW}[!] ATTENZIONE: Attività già svolta! Trovate {len(existing_clips)} clip già presenti in 'OUT/'.{RESET}", flush=True)
         logger.warning(f"[{SCRIPT_NAME}] Trovate {len(existing_clips)} clip già esistenti in OUT.")
         if args.auto:
-            print(f"{DIM}   Modalità AUTO: clip già generate presenti, salto taglio per preservare il lavoro esistente.{RESET}", flush=True)
             logger.info(f"[{SCRIPT_NAME}] Modalità AUTO: clip esistenti mantenute, step saltato.")
             return
+        print(f"\n{YELLOW}[!] ATTENZIONE: Trovate {len(existing_clips)} clip già presenti in 'OUT/'.{RESET}")
         print("   1. Sovrascrivi e rigenera tutte le clip")
         print("   2. Salta (mantieni clip esistenti)")
-        print("   3. Interrompi script", flush=True)
+        print("   3. Interrompi script")
         while True:
             sc = input("👉 Scelta [INVIO = 2 Salta]: ").strip()
             if sc in ("", "2"):
-                print(f"{GREEN}[✔] Mantenute {len(existing_clips)} clip esistenti in 'OUT/'.{RESET}", flush=True)
+                logger.info(f"[{SCRIPT_NAME}] Scelta utente: mantieni {len(existing_clips)} clip esistenti.")
                 return
             if sc == "1":
+                logger.info(f"[{SCRIPT_NAME}] Scelta utente: rigenerazione clip.")
                 break
             if sc == "3":
-                print(f"{YELLOW}[!] Elaborazione interrotta dall'utente.{RESET}", flush=True)
+                print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
+                logger.info(f"[{SCRIPT_NAME}] Interrotto dall'utente.")
                 return
-            print(f"{RED}[!] Scelta non valida.{RESET}", flush=True)
+            print(f"{RED}[!] Scelta non valida.{RESET}")
 
     default_v = risolvi_video_sorgente(dirs["out"], tipo_slug, fmt_slug)
     if args.auto:
@@ -340,35 +333,42 @@ def main():
         video_path = risolvi_video_sorgente(dirs["out"], tipo_slug, fmt_slug, raw_v or None)
 
     if not video_path or not video_path.is_file():
-        print(f"{RED}[X] Video sorgente non trovato in 'OUT/'.{RESET}", flush=True)
-        logger.error(f"[{SCRIPT_NAME}] Video sorgente non trovato.")
+        print(f"{RED}[X] [{SCRIPT_NAME}] Video sorgente non trovato in 'OUT/'.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] Video sorgente non trovato in '{dirs['out']}'.")
         sys.exit(1)
 
-    basket_times = load_timestamps(dirs["out"], tipo_slug, fmt_slug)
+    basket_times, ts_source_path = load_timestamps(dirs["out"], tipo_slug, fmt_slug)
     if not basket_times:
-        print(f"{RED}[X] Nessun timestamp trovato in 'OUT/' ({tipo_slug}_{fmt_slug}_timestamps.txt o timestamps.txt).{RESET}", flush=True)
-        logger.error(f"[{SCRIPT_NAME}] Timestamp mancanti in OUT.")
+        print(f"{RED}[X] [{SCRIPT_NAME}] Nessun timestamp trovato in 'OUT/' ({tipo_slug}_{fmt_slug}_timestamps.txt o timestamps.txt).{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] Timestamp mancanti o vuoti in '{dirs['out']}'.")
         sys.exit(1)
 
     vid_dur = get_video_duration(video_path)
+    logger.info(f"[{SCRIPT_NAME}] Video sorgente='{video_path}' (durata={vid_dur}) | file_ts='{ts_source_path}' (voci={len(basket_times)})")
     if vid_dur:
-        basket_times = [t for t in basket_times if time_to_seconds(t) <= vid_dur]
+        valid_times = [t for t in basket_times if time_to_seconds(t) <= vid_dur]
+        if len(valid_times) != len(basket_times):
+            logger.warning(f"[{SCRIPT_NAME}] Scartati {len(basket_times) - len(valid_times)} timestamp oltre durata video ({vid_dur:.2f}s).")
+        basket_times = valid_times
 
     if not basket_times:
-        print(f"{RED}[X] Nessun timestamp valido rispetto alla durata del video.{RESET}", flush=True)
+        print(f"{RED}[X] [{SCRIPT_NAME}] Nessun timestamp valido rispetto alla durata del video.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] Nessun timestamp valido rispetto alla durata video ({vid_dur}).")
         sys.exit(1)
 
     if args.auto:
         buffer_before, buffer_after = float(args.before), float(args.after)
-        print(f"\n{CYAN}⏱️  Tempi taglio (AUTO): {buffer_before:g}s prima / {buffer_after:g}s dopo.{RESET}", flush=True)
     else:
         buffer_before, buffer_after = chiedi_tempi_taglio(args.before, args.after)
 
     clip_duration = buffer_before + buffer_after
-    print(f"{CYAN}Taglio parallelo di {len(basket_times)} clip ({buffer_before:g}s prima + {buffer_after:g}s dopo = {clip_duration:.1f}s)...{RESET}", flush=True)
-    logger.info(f"[{SCRIPT_NAME}] Avvio taglio {len(basket_times)} clip (prima={buffer_before}s, dopo={buffer_after}s, tot={clip_duration}s) su {res['max_workers']} worker.")
+    logger.info(
+        f"[{SCRIPT_NAME}] Avvio taglio {len(basket_times)} clip (prima={buffer_before}s, dopo={buffer_after}s, tot={clip_duration}s) "
+        f"su {res['max_workers']} worker (threads_per_worker={res['threads_per_worker']})."
+    )
 
     ok_cnt = err_cnt = 0
+    errors_list: list[str] = []
     bar_lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=res["max_workers"]) as pool:
         futures = {}
@@ -378,21 +378,24 @@ def main():
             fut = pool.submit(extract_clip, video_path, ts, out_clip, buffer_before, clip_duration, res, logger)
             futures[fut] = out_clip.name
 
-        with tqdm(total=len(basket_times), desc="Taglio Clip", unit="clip", colour="blue", ncols=78) as bar:
+        with tqdm(total=len(basket_times), desc="04 | Taglio Clip", unit="clip", colour="blue", ncols=78) as bar:
             for fut in as_completed(futures):
-                ok = fut.result()
+                ok, err_msg = fut.result()
                 with bar_lock:
                     if ok:
                         ok_cnt += 1
                     else:
                         err_cnt += 1
+                        errors_list.append(err_msg)
                     bar.set_postfix({"ok": ok_cnt, "err": err_cnt})
                     bar.update(1)
 
-    print(f"\n{GREEN}[✔] Taglio completato! Clip generate: {ok_cnt}/{len(basket_times)} (errori: {err_cnt}){RESET}")
-    print(f"    Cartella clip : 'OUT/'")
-    print(f"    Log salvato   : 'LOG/' ({log_file.name})", flush=True)
-    logger.info(f"[{SCRIPT_NAME}] Completato: ok={ok_cnt}, err={err_cnt}")
+    logger.info(f"[{SCRIPT_NAME}] Completato: ok={ok_cnt}/{len(basket_times)}, err={err_cnt}")
+
+    if err_cnt > 0:
+        print(f"\n{RED}[X] [{SCRIPT_NAME}] Errori durante il taglio di {err_cnt}/{len(basket_times)} clip (log: {log_file.name}):{RESET}", file=sys.stderr)
+        for e in errors_list[:5]:
+            print(f"{RED}   • {e}{RESET}", file=sys.stderr)
 
     if ok_cnt == 0:
         sys.exit(1)

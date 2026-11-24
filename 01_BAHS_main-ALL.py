@@ -10,9 +10,10 @@ import subprocess
 from importlib import metadata
 from datetime import datetime
 from pathlib import Path
-from tqdm import tqdm
 
 SCRIPT_NAME = "01_BAHS_main-ALL"
+BAR_WIDTH = 82
+DIVIDER = "=" * BAR_WIDTH
 
 REQUIRED_DIRS = ["IN", "OUT", "FINAL", "TMP", "LOG", "MUSIC", "EXTRA"]
 PROTECTED_CLEAN_DIRS = {"IN", "EXTRA", "MUSIC"}
@@ -154,7 +155,7 @@ def setup_logger(log_dir: Path) -> tuple[logging.Logger, Path]:
 
 
 def stampa_banner(res: dict):
-    print(f"{BOLD}{CYAN}{'=' * 82}{RESET}")
+    print(f"{BOLD}{CYAN}{DIVIDER}{RESET}")
     print(f" {BOLD}{GREEN}BAHS - BASKETBALL AUTOMATION HIGHLIGHTS SUITE (MAIN ORCHESTRATOR){RESET}")
     print(f" {YELLOW}[Caratteristiche Sistema]{RESET}")
     print(f"   • Thread logici    : {BOLD}{res['threads']}{RESET}")
@@ -163,18 +164,20 @@ def stampa_banner(res: dict):
     print(f"   • Worker paralleli : {BOLD}{res['max_workers']}{RESET}")
     print(f"   • Thread / Worker  : {BOLD}{res['threads_per_worker']}{RESET}")
     print(f"   • Preset codifica  : {BOLD}{res['preset']}{RESET}")
-    print(f"{BOLD}{CYAN}{'=' * 82}{RESET}\n")
+    print(f"{BOLD}{CYAN}{DIVIDER}{RESET}\n")
 
 
 def verifica_e_crea_cartelle(base_dir: Path, logger: logging.Logger):
     print(f"{BOLD}{CYAN}[1/4] Verifica e creazione cartelle di lavoro...{RESET}")
-    with tqdm(REQUIRED_DIRS, desc="Cartelle", unit="dir", colour="cyan", ncols=78) as bar:
-        for d in bar:
-            p = base_dir / d
-            existed = p.exists()
-            p.mkdir(parents=True, exist_ok=True)
-            bar.set_postfix_str("OK" if existed else "CREATA")
-            logger.info(f"Cartella '{d}': {'esistente' if existed else 'creata'}")
+    created_cnt = 0
+    for d in REQUIRED_DIRS:
+        p = base_dir / d
+        existed = p.exists()
+        p.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            created_cnt += 1
+        logger.info(f"[{SCRIPT_NAME}] Cartella '{d}': {'esistente' if existed else 'creata'} ({p})")
+    print(f"   {GREEN}[✔] Cartelle verificate ({len(REQUIRED_DIRS)} totali, {created_cnt} create).{RESET}")
     print(f"{DIM}   Cartelle protette dalla pulizia: {', '.join(sorted(PROTECTED_CLEAN_DIRS))}{RESET}\n")
 
 
@@ -191,11 +194,11 @@ def attendi_file_in_cartella_in(base_dir: Path, logger: logging.Logger) -> list[
         videos = lista_video_in(base_dir)
         if videos:
             print(f"   {GREEN}[✔] Trovati {len(videos)} file video validi nella cartella 'IN/'.{RESET}\n")
-            logger.info(f"File video presenti in IN: {[v.name for v in videos]}")
+            logger.info(f"[{SCRIPT_NAME}] File video presenti in IN ({len(videos)}): {[v.name for v in videos]}")
             return videos
 
         if not avvisato_log:
-            logger.warning("Cartella 'IN/' priva di file video supportati. In attesa inserimento utente.")
+            logger.warning(f"[{SCRIPT_NAME}] Cartella 'IN/' priva di file video supportati. In attesa inserimento utente.")
             avvisato_log = True
 
         print(f"\n   {RED}{BOLD}[!] ATTENZIONE: Nessun file video trovato nella cartella 'IN/'.{RESET}")
@@ -203,7 +206,7 @@ def attendi_file_in_cartella_in(base_dir: Path, logger: logging.Logger) -> list[
         scelta = input(f"\n   ⏳ Inserisci i video in 'IN/' e premi [INVIO] per ricontrollare (oppure '0' per uscire): ").strip().lower()
         if scelta in ("0", "q", "quit", "exit"):
             print(f"   {YELLOW}[!] Uscita dallo script richiesta dall'utente.{RESET}")
-            logger.info("Uscita dallo script durante attesa file in IN/.")
+            logger.info(f"[{SCRIPT_NAME}] Uscita dallo script durante attesa file in IN/.")
             sys.exit(0)
 
 
@@ -266,13 +269,13 @@ def verifica_ffmpeg_e_requirements(base_dir: Path, logger: logging.Logger) -> bo
                 print(f"   {GREEN}[✔] Tutti i requirements in 'requirements.txt' sono installati.{RESET}")
             else:
                 print(f"   {GREEN}[✔] Pacchetti Python principali verificati.{RESET}")
-            logger.info("Controllo FFmpeg/FFprobe e requirements superato.")
+            logger.info(f"[{SCRIPT_NAME}] Controllo FFmpeg/FFprobe e requirements superato (has_req_file={has_req_file}).")
             return True
 
         print(f"\n   {RED}{BOLD}[X] Controllo ambiente non superato!{RESET}")
         if not ffmpeg_ok:
             print(f"   {RED}   • FFmpeg o FFprobe mancanti nel PATH di sistema.{RESET}")
-            logger.error("FFmpeg o FFprobe mancanti nel PATH.")
+            logger.error(f"[{SCRIPT_NAME}] FFmpeg o FFprobe mancanti nel PATH.")
 
         if all_missing_pkgs:
             print(f"   {RED}   • Requirements mancanti: {', '.join(all_missing_pkgs)}{RESET}")
@@ -280,7 +283,7 @@ def verifica_ffmpeg_e_requirements(base_dir: Path, logger: logging.Logger) -> bo
                 print(f"   {YELLOW}     Installa i requirements eseguendo: pip install -r \"{req_file.name}\"{RESET}")
             else:
                 print(f"   {YELLOW}     Installa i pacchetti mancanti eseguendo: pip install {' '.join(all_missing_pkgs)}{RESET}")
-            logger.error(f"Requirements mancanti: {all_missing_pkgs}")
+            logger.error(f"[{SCRIPT_NAME}] Requirements mancanti: {all_missing_pkgs}")
 
         print("\n   Cosa vuoi fare?")
         print("     1. Ho installato quanto richiesto -> Ricontrolla ora")
@@ -291,7 +294,7 @@ def verifica_ffmpeg_e_requirements(base_dir: Path, logger: logging.Logger) -> bo
                 break
             if sc in ("0", "q", "quit", "exit"):
                 print(f"   {YELLOW}[!] Uscita dallo script.{RESET}")
-                logger.info("Uscita dallo script per dipendenze/requirements mancanti.")
+                logger.info(f"[{SCRIPT_NAME}] Uscita dallo script per dipendenze/requirements mancanti.")
                 return False
             print(f"   {RED}[!] Scelta non valida. Inserisci 1 oppure 0.{RESET}")
 
@@ -324,11 +327,11 @@ def chiedi_pulizia_cartelle(base_dir: Path, log_file_attuale: Path, logger: logg
         scelta = input(f"\n👉 Scelta pulizia (1-2, 0 per uscire) [INVIO = 2 Non ripulire]: ").strip().lower()
         if scelta in ("0", "q", "quit", "exit"):
             print(f"   {YELLOW}[!] Uscita dallo script richiesta dall'utente.{RESET}")
-            logger.info("Uscita dallo script durante scelta pulizia cartelle.")
+            logger.info(f"[{SCRIPT_NAME}] Uscita dallo script durante scelta pulizia cartelle.")
             sys.exit(0)
         if scelta in ("", "2"):
             print(f"   {DIM}Nessuna pulizia effettuata.{RESET}\n")
-            logger.info("Pulizia cartelle saltata dall'utente.")
+            logger.info(f"[{SCRIPT_NAME}] Pulizia cartelle saltata dall'utente.")
             return
         if scelta == "1":
             break
@@ -340,30 +343,28 @@ def chiedi_pulizia_cartelle(base_dir: Path, log_file_attuale: Path, logger: logg
         target_p = base_dir / d_name
         if not target_p.exists():
             print(f"   {DIM}Cartella '{d_name}/' non presente: nulla da ripulire.{RESET}")
-            logger.info(f"Cartella '{d_name}/' non esistente durante pulizia.")
+            logger.info(f"[{SCRIPT_NAME}] Cartella '{d_name}/' non esistente durante pulizia.")
             continue
         items = list(target_p.iterdir())
         if not items:
             print(f"   {GREEN}[✔] Cartella '{d_name}/' già vuota (0 elementi da rimuovere).{RESET}")
-            logger.info(f"Cartella '{d_name}/' già vuota.")
+            logger.info(f"[{SCRIPT_NAME}] Cartella '{d_name}/' già vuota.")
             continue
         non_rimossi: list[str] = []
-        with tqdm(items, desc=f"Pulizia {d_name}/", unit="elem", colour="yellow", ncols=78) as bar:
-            for item in bar:
-                try:
-                    _rimuovi_elemento_forzato(item)
-                except Exception as e:
-                    non_rimossi.append(item.name)
-                    logger.warning(f"Impossibile rimuovere '{item.name}' in '{d_name}/': {e}")
+        for item in items:
+            try:
+                _rimuovi_elemento_forzato(item)
+            except Exception as e:
+                non_rimossi.append(item.name)
+                logger.warning(f"[{SCRIPT_NAME}] Impossibile rimuovere '{item.name}' in '{d_name}/': {e}")
 
         residui = [p.name for p in target_p.iterdir()] if target_p.exists() else []
         if not residui:
-            print(f"   {GREEN}[✔] Cartella '{d_name}/' completamente ripulita.{RESET}")
-            logger.info(f"Cartella '{d_name}/' completamente svuotata.")
+            print(f"   {GREEN}[✔] Cartella '{d_name}/' completamente ripulita ({len(items)} elementi).{RESET}")
+            logger.info(f"[{SCRIPT_NAME}] Cartella '{d_name}/' completamente svuotata ({len(items)} elementi).")
         else:
-            print(f"   {YELLOW}[!] ATTENZIONE: Attività già svolta! File esistente{RESET}")
-            print(f"   {DIM}    Residui in '{d_name}/' ({len(residui)}): {', '.join(residui)} - Chiudi eventuali programmi/player che li stanno usando e riprova se necessario.{RESET}")
-            logger.warning(f"Residui in '{d_name}/': {residui} (errori su: {non_rimossi})")
+            print(f"   {YELLOW}[!] ATTENZIONE: Residui in '{d_name}/' ({len(residui)}): {', '.join(residui)} - Chiudi eventuali programmi/player che li stanno usando e riprova se necessario.{RESET}")
+            logger.warning(f"[{SCRIPT_NAME}] Residui in '{d_name}/': {residui} (errori su: {non_rimossi})")
 
     log_dir = base_dir / "LOG"
     old_logs = [f for f in log_dir.iterdir() if f.is_file() and f.resolve() != log_file_attuale.resolve()]
@@ -374,9 +375,9 @@ def chiedi_pulizia_cartelle(base_dir: Path, log_file_attuale: Path, logger: logg
             try:
                 _rimuovi_elemento_forzato(lf)
             except Exception as e:
-                logger.warning(f"Impossibile rimuovere vecchio log '{lf.name}': {e}")
-        print(f"   {GREEN}[✔] Vecchi log rimossi in 'LOG/' (log sessione corrente preservato).{RESET}")
-    logger.info(f"Rimossi {len(old_logs)} vecchi file di log in LOG/.")
+                logger.warning(f"[{SCRIPT_NAME}] Impossibile rimuovere vecchio log '{lf.name}': {e}")
+        print(f"   {GREEN}[✔] Vecchi log rimossi in 'LOG/' ({len(old_logs)} file, log sessione corrente preservato).{RESET}")
+    logger.info(f"[{SCRIPT_NAME}] Rimossi {len(old_logs)} vecchi file di log in LOG/.")
     print()
 
 
@@ -475,7 +476,7 @@ def costruisci_pipeline(base_dir: Path, tipo_incontro: str, formato: str, logger
     timestamps_file = base_dir / "OUT" / "timestamps.txt"
     skip_timestamps = ha_timestamp_validi(timestamps_file)
     if skip_timestamps and logger:
-        logger.info(f"Trovato '{timestamps_file}' valido per HIGHLIGHTS ({fmt_upper}): step 03_BAHS_identify-timestamps-ALL.py saltato.")
+        logger.info(f"[{SCRIPT_NAME}] Trovato '{timestamps_file}' valido per HIGHLIGHTS ({fmt_upper}): step 03_BAHS_identify-timestamps-ALL.py saltato.")
 
     if fmt_upper == "REEL":
         raw_steps = [
@@ -526,12 +527,22 @@ def trova_output_logo_finale(base_dir: Path, tipo_incontro: str, formato: str) -
     return matches[0] if matches else None
 
 
-def esegui_script_diretto(base_dir: Path, script_name: str, tipo_incontro: str, riga_seconda: str, formato: str, interactive: bool, logger: logging.Logger) -> bool:
+def stampa_intestazione_step(step_num: int, total_steps: int, step_info: dict):
+    banner = (
+        f"\n{CYAN}{DIVIDER}\n"
+        f"{BOLD}▶ [STEP {step_num}/{total_steps} IN ESECUZIONE]{RESET}{CYAN} {step_info['label']}\n"
+        f"  📄 Modulo: {BOLD}{step_info['script']}{RESET}\n"
+        f"{CYAN}{DIVIDER}{RESET}"
+    )
+    print(banner, flush=True)
+
+
+def esegui_script_diretto(base_dir: Path, script_name: str, tipo_incontro: str, riga_seconda: str, formato: str, interactive: bool, logger: logging.Logger) -> tuple[bool, float]:
     script_path = base_dir / script_name
     if not script_path.is_file():
-        print(f"   {RED}[X] Modulo mancante: {script_path.name}{RESET}")
-        logger.error(f"Modulo mancante: {script_path.name}")
-        return False
+        print(f"   {RED}[X] Modulo mancante: {script_path.name}{RESET}", flush=True)
+        logger.error(f"[{SCRIPT_NAME}] Modulo mancante: {script_path}")
+        return False, 0.0
 
     cmd = [
         sys.executable,
@@ -544,14 +555,22 @@ def esegui_script_diretto(base_dir: Path, script_name: str, tipo_incontro: str, 
     if not interactive:
         cmd.append("--auto")
 
-    logger.info(f"Avvio script '{script_name}' -> cmd={cmd}")
+    t0 = time.perf_counter()
+    logger.info(f"[{SCRIPT_NAME}] Avvio script '{script_name}' (interactive={interactive}) -> cmd={cmd}")
     proc = subprocess.run(cmd, cwd=str(base_dir))
-    return proc.returncode == 0
+    elapsed_step = time.perf_counter() - t0
+    if proc.returncode == 0:
+        logger.info(f"[{SCRIPT_NAME}] Script '{script_name}' completato con successo (rc=0, tempo={elapsed_step:.2f}s).")
+        return True, elapsed_step
+
+    logger.error(f"[{SCRIPT_NAME}] Script '{script_name}' terminato con errore (rc={proc.returncode}, tempo={elapsed_step:.2f}s). Verifica il log dedicato in LOG/.")
+    return False, elapsed_step
 
 
-def esegui_step(base_dir: Path, step_info: dict, tipo_incontro: str, riga_seconda: str, formato: str, logger: logging.Logger) -> bool:
+def esegui_step(base_dir: Path, step_info: dict, step_num: int, total_steps: int, tipo_incontro: str, riga_seconda: str, formato: str, logger: logging.Logger) -> tuple[bool, float]:
     script_name = step_info["script"]
-    ok = esegui_script_diretto(
+    stampa_intestazione_step(step_num, total_steps, step_info)
+    ok, elapsed = esegui_script_diretto(
         base_dir,
         script_name,
         tipo_incontro,
@@ -563,18 +582,19 @@ def esegui_step(base_dir: Path, step_info: dict, tipo_incontro: str, riga_second
 
     if not ok and script_name == "04_BAHS_split-original-ALL.py":
         while not ok:
-            print(f"\n{YELLOW}[!] Riavvio l'attività di analisi del video.{RESET}\n")
-            print("1. Crea/aggiorna i timestamp ora e riprova split original")
-            print("0. Esci dallo script")
+            logger.warning(f"[{SCRIPT_NAME}] Fallback interattivo attivato per errore su '{script_name}': richiesto recupero timestamp con 03_BAHS_identify-timestamps-ALL.py.")
+            print(f"\n{YELLOW}[!] Riavvio l'attività di analisi del video.{RESET}\n", flush=True)
+            print("1. Crea/aggiorna i timestamp ora e riprova split original", flush=True)
+            print("0. Esci dallo script", flush=True)
             while True:
                 sc = input("\n👉 Scelta [INVIO = 1 Avanti | 0 = Esci]: ").strip().lower()
                 if sc in ("", "1"):
                     break
                 if sc in ("0", "q", "quit", "exit"):
-                    print(f"   {YELLOW}[!] Uscita dallo script richiesta dall'utente.{RESET}")
-                    logger.info("Uscita dallo script durante recupero timestamp per 04_BAHS_split-original-ALL.py.")
-                    return False
-                print(f"   {RED}[!] Scelta non valida. Inserisci 1 oppure 0.{RESET}")
+                    print(f"   {YELLOW}[!] Uscita dallo script richiesta dall'utente.{RESET}", flush=True)
+                    logger.info(f"[{SCRIPT_NAME}] Uscita dallo script durante recupero timestamp per 04_BAHS_split-original-ALL.py.")
+                    return False, elapsed
+                print(f"   {RED}[!] Scelta non valida. Inserisci 1 oppure 0.{RESET}", flush=True)
 
             esegui_script_diretto(
                 base_dir,
@@ -585,8 +605,8 @@ def esegui_step(base_dir: Path, step_info: dict, tipo_incontro: str, riga_second
                 True,
                 logger,
             )
-            print(f"\n   {BLUE}↻ Nuovo tentativo: {script_name}...{RESET}")
-            ok = esegui_script_diretto(
+            print(f"\n   {BLUE}↻ Nuovo tentativo: {script_name}...{RESET}", flush=True)
+            ok, extra_elapsed = esegui_script_diretto(
                 base_dir,
                 script_name,
                 tipo_incontro,
@@ -595,8 +615,9 @@ def esegui_step(base_dir: Path, step_info: dict, tipo_incontro: str, riga_second
                 step_info["interactive"],
                 logger,
             )
+            elapsed += extra_elapsed
 
-    return ok
+    return ok, elapsed
 
 
 def main():
@@ -606,6 +627,7 @@ def main():
     base_dir = Path(__file__).resolve().parent
     res = calcola_risorse_sistema()
     logger, log_file = setup_logger(base_dir / "LOG")
+    logger.info(f"[{SCRIPT_NAME}] Avvio orchestratore | base_dir='{base_dir}' | risorse={res}")
 
     stampa_banner(res)
     verifica_e_crea_cartelle(base_dir, logger)
@@ -618,44 +640,61 @@ def main():
     tipo_incontro, riga_seconda, formato = chiedi_parametri_incontro()
 
     pipeline = costruisci_pipeline(base_dir, tipo_incontro, formato, logger)
-    print(f"\n{BOLD}{MAGENTA}=== RIEPILOGO PIANO DI LAVORO ==={RESET}")
+    total_steps = len(pipeline)
+    print(f"\n{BOLD}{MAGENTA}{DIVIDER}{RESET}")
+    print(f" {BOLD}{MAGENTA}RIEPILOGO PIANO DI LAVORO{RESET}")
     print(f"  Tipo incontro : {BOLD}{tipo_incontro}{RESET}")
     print(f"  Seconda riga  : {BOLD}{riga_seconda}{RESET}")
     print(f"  Formato target: {BOLD}{formato}{RESET}")
     if tipo_incontro.strip().upper() == "HIGHLIGHTS" and ha_timestamp_validi(base_dir / "OUT" / "timestamps.txt"):
         print(f"  Timestamp {formato}: {GREEN}rilevato 'OUT/timestamps.txt' (step 03 saltato){RESET}")
-    print(f"  Step previsti : {len(pipeline)}\n")
-    logger.info(f"Piano avviato -> tipo='{tipo_incontro}', sottotitolo='{riga_seconda}', formato='{formato}', steps={len(pipeline)}")
+    print(f"  Step previsti : {total_steps}")
+    print(f"{BOLD}{MAGENTA}{DIVIDER}{RESET}\n")
+    logger.info(
+        f"[{SCRIPT_NAME}] Piano avviato -> tipo='{tipo_incontro}', sottotitolo='{riga_seconda}', "
+        f"formato='{formato}', steps={[s['script'] for s in pipeline]}"
+    )
 
     t_start = time.perf_counter()
-    main_bar = tqdm(total=len(pipeline), desc="Pipeline Completa", unit="step", colour="green", ncols=80)
-    try:
-        for item in pipeline:
-            main_bar.set_description(f"Step {item['step']}/{len(pipeline)}: {item['script']}")
-            print(f"\n{BOLD}{BLUE}>>> STEP {item['step']}/{len(pipeline)} - {item['label']} ({item['script']}) <<<{RESET}")
-            ok = esegui_step(base_dir, item, tipo_incontro, riga_seconda, formato, logger)
-            if not ok:
-                main_bar.close()
-                print(f"\n{RED}[X] Pipeline interrotta allo Step {item['step']} ({item['script']}). Controlla il file di log '{log_file.name}' nella cartella 'LOG/'.{RESET}")
-                logger.error(f"Pipeline interrotta allo Step {item['step']}.")
-                return
-            main_bar.update(1)
-    finally:
-        if not main_bar.disable:
-            main_bar.close()
+
+    for idx, item in enumerate(pipeline, start=1):
+        ok, step_elapsed = esegui_step(
+            base_dir,
+            item,
+            idx,
+            total_steps,
+            tipo_incontro,
+            riga_seconda,
+            formato,
+            logger,
+        )
+        if not ok:
+            print(
+                f"\n{RED}[X] Pipeline interrotta allo Step {idx}/{total_steps} ({item['script']}). "
+                f"Controlla il file di log '{log_file.name}' nella cartella 'LOG/'.{RESET}",
+                flush=True,
+            )
+            logger.error(f"[{SCRIPT_NAME}] Pipeline interrotta allo Step {idx}/{total_steps} ({item['script']}).")
+            return
+
+        print(
+            f"{GREEN}✔ [STEP {idx}/{total_steps} COMPLETATO] {item['script']} ({step_elapsed:.1f}s){RESET}",
+            flush=True,
+        )
 
     elapsed = time.perf_counter() - t_start
     final_logo_file = trova_output_logo_finale(base_dir, tipo_incontro, formato)
-    video_finale_str = f"'FINAL/' (file: '{final_logo_file.name}')" if final_logo_file else "'FINAL/'"
+    default_final_name = f"{sanitize_slug(tipo_incontro)}_{formato.strip().upper()}_with_fade_music_text_logo.mp4"
+    video_finale_nome = final_logo_file.name if final_logo_file else default_final_name
 
-    print(f"\n{BOLD}{GREEN}{'=' * 82}{RESET}")
+    print(f"\n{BOLD}{GREEN}{DIVIDER}{RESET}")
     print(f" {BOLD}{GREEN}[✔] PIPELINE COMPLETATA IN {elapsed:.1f}s!{RESET}")
-    print(f"   - Video Finale        : {video_finale_str}")
-    print(f"   - Cartella finale     : 'FINAL/'")
-    print(f"   - Cartella intermedia : 'OUT/'")
-    print(f"   - Cartella log        : 'LOG/' (file: '{log_file.name}')")
-    print(f"{BOLD}{GREEN}{'=' * 82}{RESET}\n")
-    logger.info(f"Pipeline completata in {elapsed:.2f}s. Video Finale: {final_logo_file}")
+    print(f"- Video Finale        : '{video_finale_nome}'")
+    print(f"- Cartella finale     : 'FINAL/'")
+    print(f"- Cartella intermedia : 'OUT/'")
+    print(f"- Cartella log        : 'LOG/'")
+    print(f"{BOLD}{GREEN}{DIVIDER}{RESET}\n")
+    logger.info(f"[{SCRIPT_NAME}] Pipeline completata in {elapsed:.2f}s. Video Finale: {final_logo_file or video_finale_nome}")
 
 
 if __name__ == "__main__":

@@ -36,10 +36,6 @@ def abilita_ansi():
             os.system("")
 
 
-def pulisci_console():
-    os.system("cls" if os.name == "nt" else "clear")
-
-
 def rileva_ram_gb() -> tuple[float, float]:
     try:
         import psutil  # type: ignore
@@ -195,21 +191,25 @@ def parse_progress_ms(line: str) -> int | None:
 def gestione_file_esistente(out_file: Path, auto: bool, logger: logging.Logger) -> str:
     if not out_file.is_file() or out_file.stat().st_size == 0:
         return "overwrite"
-    print(f"\n{YELLOW}[!] ATTENZIONE: Attività già svolta! File esistente{RESET}")
-    logger.warning(f"[{SCRIPT_NAME}] File già esistente: {out_file}")
+    size_mb = out_file.stat().st_size / (1024 * 1024)
+    logger.warning(f"[{SCRIPT_NAME}] File già esistente: '{out_file}' ({size_mb:.1f} MB)")
     if auto:
-        print(f"{DIM}   Modalità AUTO: logo già applicato, salto passaggio.{RESET}")
+        logger.info(f"[{SCRIPT_NAME}] Modalità AUTO: file esistente mantenuto, step saltato.")
         return "skip"
+    print(f"\n{YELLOW}[!] ATTENZIONE: File esistente: 'FINAL/{out_file.name}' ({size_mb:.1f} MB){RESET}")
     print("   1. Sovrascrivi e rigenera")
     print("   2. Salta (mantieni file esistente)")
     print("   3. Interrompi script")
     while True:
         sc = input("👉 Scelta [INVIO = 2 Salta]: ").strip()
         if sc in ("", "2"):
+            logger.info(f"[{SCRIPT_NAME}] Scelta utente: mantieni file esistente.")
             return "skip"
         if sc == "1":
+            logger.info(f"[{SCRIPT_NAME}] Scelta utente: sovrascrivi file esistente.")
             return "overwrite"
         if sc == "3":
+            logger.info(f"[{SCRIPT_NAME}] Scelta utente: interrompi script.")
             return "abort"
         print(f"{RED}[!] Scelta non valida.{RESET}")
 
@@ -233,22 +233,20 @@ def attendi_logo_in_cartella_extra(extra_dir: Path, logger: logging.Logger) -> P
             logger.warning(f"[{SCRIPT_NAME}] Nessun file 'logo.*' trovato in 'EXTRA/' ({', '.join(LOGO_EXTS)}).")
             avvisato_log = True
 
-        print(f"\n{RED}{BOLD}[X] Nessun file 'logo.*' trovato nella cartella 'EXTRA/' ({', '.join(LOGO_EXTS)}).{RESET}")
-        print(f"{YELLOW}[!] Inserisci un file 'logo.*' nella cartella 'EXTRA/' e riavvio lo script.{RESET}")
+        print(f"\n{RED}{BOLD}[X] [{SCRIPT_NAME}] Nessun file 'logo.*' trovato nella cartella 'EXTRA/' ({', '.join(LOGO_EXTS)}).{RESET}", file=sys.stderr)
+        print(f"{YELLOW}[!] Inserisci un file 'logo.*' nella cartella 'EXTRA/' prima di proseguire.{RESET}")
         sc = input("\n👉 Premi [INVIO] per riavviare lo script (oppure '0' per uscire): ").strip().lower()
         if sc in ("0", "q", "quit", "exit"):
-            print(f"{YELLOW}[!] Elaborazione interrotta dall'utente.{RESET}")
+            print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
             logger.info(f"[{SCRIPT_NAME}] Uscita richiesta dall'utente per mancanza logo in EXTRA/.")
             sys.exit(1)
 
-        pulisci_console()
         script_file = str(Path(__file__).resolve())
         os.execv(sys.executable, [sys.executable, script_file] + sys.argv[1:])
 
 
 def main():
     abilita_ansi()
-    pulisci_console()
 
     parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Sovraimpressione logo 1080P o REEL")
     parser.add_argument("--base-dir", default=".")
@@ -268,19 +266,18 @@ def main():
 
     tipo_slug = sanitize_slug(args.tipo)
 
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}")
-    print(f" {BOLD}{GREEN}INIZIO: {SCRIPT_NAME}{RESET} | Tipo: {BOLD}{args.tipo}{RESET} | Formato: {BOLD}{fmt_slug}{RESET}")
-    print(f" {YELLOW}[CPU/RAM]{RESET} Thread: {res['threads']} | RAM disp.: {res['ram_avail']}/{res['ram_tot']} GB | Preset: {res['preset']}")
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}\n")
-    logger.info(f"[{SCRIPT_NAME}] Avvio | tipo={args.tipo} | formato={fmt_slug} | risorse={res}")
+    logger.info(
+        f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | formato='{fmt_slug}' | "
+        f"auto={args.auto} | risorse={res}"
+    )
 
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        print(f"{RED}[X] FFmpeg o FFprobe non trovati nel PATH.{RESET}")
+        print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.")
         sys.exit(1)
 
     logo_path = attendi_logo_in_cartella_extra(dirs["extra"], logger)
-    print(f"{GREEN}[✔] Logo trovato in 'EXTRA/': '{logo_path.name}'{RESET}")
-    logger.info(f"[{SCRIPT_NAME}] Utilizzo logo: {logo_path}")
+    logger.info(f"[{SCRIPT_NAME}] Utilizzo logo: '{logo_path}'")
 
     if fmt_slug == "REEL":
         preferred = [
@@ -326,8 +323,8 @@ def main():
 
     in_video = next((p for p in preferred if p.is_file()), None)
     if not in_video:
-        print(f"{RED}[X] Nessun video {fmt_slug} idoneo trovato in 'FINAL/', 'TMP/' o 'OUT/'.{RESET}")
-        logger.error(f"[{SCRIPT_NAME}] Nessun video {fmt_slug} trovato.")
+        print(f"{RED}[X] [{SCRIPT_NAME}] Nessun video {fmt_slug} idoneo trovato in 'FINAL/', 'TMP/' o 'OUT/'.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] Nessun video {fmt_slug} idoneo trovato.")
         sys.exit(1)
 
     fade_flag, has_music_flag, has_text_flag = parse_video_layers(in_video)
@@ -342,12 +339,17 @@ def main():
     out_file = dirs["final"] / stage_name
     tmp_out_file = dirs["tmp"] / stage_name
 
+    logger.info(
+        f"[{SCRIPT_NAME}] Video input='{in_video}' | layers=(fade={fade_flag}, music={has_music_flag}, text={has_text_flag}) | "
+        f"logo_size={lw}px | margin=({mx},{my}) | out_file='{out_file}'"
+    )
+
     azione = gestione_file_esistente(out_file, args.auto, logger)
     if azione == "abort":
-        print(f"{YELLOW}[!] Elaborazione interrotta dall'utente.{RESET}")
+        print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
         return
     if azione == "skip":
-        print(f"{GREEN}[✔] Mantenuto file esistente: 'FINAL/{out_file.name}'{RESET}")
+        logger.info(f"[{SCRIPT_NAME}] Completato (SKIP): mantenuto '{out_file}'.")
         return
 
     fc = (
@@ -358,7 +360,14 @@ def main():
     )
 
     total_ms = get_duration_ms(in_video)
-    cmd = ["ffmpeg", "-i", str(in_video), "-i", str(logo_path), "-filter_complex", fc, "-map", "[v_out]"]
+    cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-i", str(in_video),
+        "-i", str(logo_path),
+        "-filter_complex", fc,
+        "-map", "[v_out]",
+    ]
     if has_audio(in_video):
         cmd.extend(["-map", "0:a?", "-c:a", "aac", "-b:a", "192k"])
     cmd.extend([
@@ -373,6 +382,7 @@ def main():
         "-y",
         str(tmp_out_file),
     ])
+    logger.info(f"[{SCRIPT_NAME}] Esecuzione FFmpeg (durata_video_ms={total_ms}): {cmd}")
 
     stderr_lines: list[str] = []
 
@@ -394,7 +404,7 @@ def main():
             t_err.start()
 
         last_ms = 0
-        with tqdm(total=max(1, total_ms), desc=f"Logo {fmt_slug}", unit="ms", unit_scale=True, colour=bar_col, ncols=78) as bar:
+        with tqdm(total=max(1, total_ms), desc=f"10 | Logo {fmt_slug}", unit="ms", unit_scale=True, colour=bar_col, ncols=78) as bar:
             if proc.stdout:
                 for raw in iter(proc.stdout.readline, ""):
                     line = raw.strip()
@@ -412,13 +422,14 @@ def main():
         t_err.join(timeout=5.0)
 
         if rc != 0 or not tmp_out_file.is_file() or tmp_out_file.stat().st_size == 0:
-            print(f"\n{RED}[X] Errore durante l'overlay logo.{RESET}")
-            logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg (rc={rc}): {' '.join(stderr_lines[-5:])}")
+            err_msg = " ".join(stderr_lines[-8:]) or f"returncode={rc}"
+            print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore durante l'overlay logo (log: {log_file.name}).{RESET}", file=sys.stderr)
+            logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg (rc={rc}): {err_msg}")
             sys.exit(1)
 
         shutil.move(str(tmp_out_file), str(out_file))
-        print(f"\n{GREEN}[✔] Overlay logo completato! Output: 'FINAL/{out_file.name}'{RESET}")
-        logger.info(f"[{SCRIPT_NAME}] Completato: {out_file} | Log: {log_file}")
+        size_mb = out_file.stat().st_size / (1024 * 1024)
+        logger.info(f"[{SCRIPT_NAME}] Completato con successo: '{out_file}' ({size_mb:.2f} MB)")
     finally:
         if tmp_out_file.exists():
             tmp_out_file.unlink(missing_ok=True)

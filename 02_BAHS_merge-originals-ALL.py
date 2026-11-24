@@ -33,10 +33,6 @@ def abilita_ansi():
             os.system("")
 
 
-def pulisci_console():
-    os.system("cls" if os.name == "nt" else "clear")
-
-
 def rileva_ram_gb() -> tuple[float, float]:
     try:
         import psutil  # type: ignore
@@ -131,31 +127,32 @@ def gestione_file_esistente(out_file: Path, auto: bool, logger: logging.Logger) 
         return "overwrite"
 
     size_mb = out_file.stat().st_size / (1024 * 1024)
-    print(f"\n{YELLOW}[!] ATTENZIONE: Attività già svolta! File esistente: '{out_file.name}' ({size_mb:.1f} MB){RESET}")
-    logger.warning(f"[{SCRIPT_NAME}] File di output già esistente: {out_file} ({size_mb:.1f} MB)")
+    logger.warning(f"[{SCRIPT_NAME}] File di output già esistente: '{out_file}' ({size_mb:.1f} MB)")
 
     if auto:
-        print(f"{DIM}   Modalità AUTO: attività già completata, salto rigenerazione e mantengo il file esistente.{RESET}")
         logger.info(f"[{SCRIPT_NAME}] Modalità AUTO: file già presente, step saltato.")
         return "skip"
 
+    print(f"\n{YELLOW}[!] ATTENZIONE: File di output già esistente: '{out_file.name}' ({size_mb:.1f} MB){RESET}")
     print("   1. Sovrascrivi e rigenera")
     print("   2. Salta (mantieni file esistente e prosegui)")
     print("   3. Interrompi script")
     while True:
         sc = input("👉 Scelta [INVIO = 2 Salta]: ").strip()
         if sc in ("", "2"):
+            logger.info(f"[{SCRIPT_NAME}] Scelta utente: mantieni file esistente.")
             return "skip"
         if sc == "1":
+            logger.info(f"[{SCRIPT_NAME}] Scelta utente: sovrascrivi file esistente.")
             return "overwrite"
         if sc == "3":
+            logger.info(f"[{SCRIPT_NAME}] Scelta utente: interrompi script.")
             return "abort"
         print(f"{RED}[!] Scelta non valida (1, 2 o 3).{RESET}")
 
 
 def main():
     abilita_ansi()
-    pulisci_console()
 
     parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Unione video originali da IN a OUT")
     parser.add_argument("--base-dir", default=".")
@@ -178,45 +175,45 @@ def main():
     legacy_named = dirs["out"] / f"merged_orig_{tipo_slug}_{fmt_slug}.mp4"
     list_file = dirs["tmp"] / f"concat_orig_{tipo_slug}_{fmt_slug}.txt"
 
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}")
-    print(f" {BOLD}{GREEN}INIZIO: {SCRIPT_NAME}{RESET} | Formato: {BOLD}{fmt_slug}{RESET} | Tipo: {BOLD}{args.tipo}{RESET}")
-    print(f" {YELLOW}[CPU/RAM]{RESET} Thread: {res['threads']} | RAM disp.: {res['ram_avail']}/{res['ram_tot']} GB | Worker: {res['max_workers']}")
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}\n")
-    logger.info(f"[{SCRIPT_NAME}] Avvio | tipo={args.tipo} | formato={fmt_slug} | risorse={res}")
+    logger.info(
+        f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | formato='{fmt_slug}' | "
+        f"auto={args.auto} | out_file='{out_file}' | risorse={res}"
+    )
 
     if shutil.which("ffmpeg") is None:
-        print(f"{RED}[X] FFmpeg non trovato nel PATH.{RESET}")
-        logger.error(f"[{SCRIPT_NAME}] FFmpeg non trovato.")
+        print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg non trovato nel PATH.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] FFmpeg non trovato nel PATH.")
         sys.exit(1)
 
     target_check = out_file if out_file.is_file() else (legacy_named if legacy_named.is_file() else out_file)
     azione = gestione_file_esistente(target_check, args.auto, logger)
     if azione == "abort":
-        print(f"{YELLOW}[!] Elaborazione interrotta dall'utente.{RESET}")
+        print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
         return
     if azione == "skip":
         if not out_file.is_file() and target_check.is_file():
             shutil.copy2(target_check, out_file)
-        print(f"{GREEN}[✔] Mantenuto file esistente: '{out_file}'{RESET}")
-        print(f"{DIM}Log: {log_file}{RESET}")
+            logger.info(f"[{SCRIPT_NAME}] Copiato file legacy '{target_check}' in '{out_file}'.")
+        logger.info(f"[{SCRIPT_NAME}] Completato (SKIP): mantenuto '{out_file}'.")
         return
 
     videos = sorted([p for p in dirs["in"].iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS])
     if not videos:
-        print(f"{RED}[X] Nessun video trovato in '{dirs['in']}'.{RESET}")
-        logger.error(f"[{SCRIPT_NAME}] Nessun video in {dirs['in']}.")
+        print(f"{RED}[X] [{SCRIPT_NAME}] Nessun video trovato in '{dirs['in']}'.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] Nessun video trovato in '{dirs['in']}'.")
         sys.exit(1)
 
-    print(f"{CYAN}Trovati {len(videos)} video originali in 'IN/'.{RESET}")
-    logger.info(f"[{SCRIPT_NAME}] Video in IN: {[v.name for v in videos]}")
+    logger.info(f"[{SCRIPT_NAME}] Trovati {len(videos)} video originali in IN: {[v.name for v in videos]}")
 
     try:
         with open(list_file, "w", encoding="utf-8") as f:
-            for v in tqdm(videos, desc="Preparazione lista", unit="video", colour="blue", ncols=78):
+            for v in videos:
                 f.write(f"file '{v.resolve().as_posix()}'\n")
+        logger.info(f"[{SCRIPT_NAME}] Generata lista concat in '{list_file}' ({len(videos)} file).")
 
         cmd = [
             "ffmpeg",
+            "-loglevel", "error",
             "-y",
             "-f", "concat",
             "-safe", "0",
@@ -225,28 +222,28 @@ def main():
             "-c", "copy",
             str(out_file),
         ]
+        logger.info(f"[{SCRIPT_NAME}] Esecuzione comando FFmpeg: {cmd}")
 
-        with tqdm(total=100, desc="Unione FFmpeg", unit="%", colour="green", ncols=78) as bar:
+        with tqdm(total=100, desc="02 | Unione Originali", unit="%", colour="green", ncols=78) as bar:
             bar.update(20)
             proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             bar.update(80)
 
         if proc.returncode != 0 or not out_file.is_file() or out_file.stat().st_size == 0:
-            print(f"\n{RED}[X] Errore durante l'unione con FFmpeg.{RESET}")
-            logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg: {proc.stderr.strip()}")
+            err_msg = proc.stderr.strip() or f"returncode={proc.returncode}"
+            print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore durante l'unione con FFmpeg (log: {log_file.name}).{RESET}", file=sys.stderr)
+            logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg (rc={proc.returncode}): {err_msg}")
             sys.exit(1)
 
-        print(f"\n{GREEN}[✔] Video originali uniti con successo!{RESET}")
-        print(f"    File uniforme: '{out_file}'")
-        print(f"    Log salvato  : '{log_file}'")
-        logger.info(f"[{SCRIPT_NAME}] Completato: {out_file}")
+        size_mb = out_file.stat().st_size / (1024 * 1024)
+        logger.info(f"[{SCRIPT_NAME}] Completato con successo: '{out_file}' ({size_mb:.2f} MB)")
 
     finally:
         if list_file.exists():
             try:
                 list_file.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[{SCRIPT_NAME}] Impossibile rimuovere file temporaneo '{list_file}': {e}")
 
 
 if __name__ == "__main__":

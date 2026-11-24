@@ -37,10 +37,6 @@ def abilita_ansi():
             os.system("")
 
 
-def pulisci_console():
-    os.system("cls" if os.name == "nt" else "clear")
-
-
 def rileva_ram_gb() -> tuple[float, float]:
     try:
         import psutil  # type: ignore
@@ -182,21 +178,24 @@ def gestione_file_esistente(out_file: Path, auto: bool, logger: logging.Logger) 
     if not out_file.is_file() or out_file.stat().st_size == 0:
         return "overwrite"
     size_mb = out_file.stat().st_size / (1024 * 1024)
-    print(f"\n{YELLOW}[!] ATTENZIONE: Attività già svolta! File esistente: 'FINAL/{out_file.name}' ({size_mb:.1f} MB){RESET}")
-    logger.warning(f"[{SCRIPT_NAME}] File già esistente: {out_file}")
+    logger.warning(f"[{SCRIPT_NAME}] File già esistente: '{out_file}' ({size_mb:.1f} MB)")
     if auto:
-        print(f"{DIM}   Modalità AUTO: mix musicale già presente, salto passaggio.{RESET}")
+        logger.info(f"[{SCRIPT_NAME}] Modalità AUTO: file esistente mantenuto, step saltato.")
         return "skip"
+    print(f"\n{YELLOW}[!] ATTENZIONE: File esistente: 'FINAL/{out_file.name}' ({size_mb:.1f} MB){RESET}")
     print("   1. Sovrascrivi e rigenera")
     print("   2. Salta (mantieni file esistente)")
     print("   3. Interrompi script")
     while True:
         sc = input("👉 Scelta [INVIO = 2 Salta]: ").strip()
         if sc in ("", "2"):
+            logger.info(f"[{SCRIPT_NAME}] Scelta utente: mantieni file esistente.")
             return "skip"
         if sc == "1":
+            logger.info(f"[{SCRIPT_NAME}] Scelta utente: sovrascrivi file esistente.")
             return "overwrite"
         if sc == "3":
+            logger.info(f"[{SCRIPT_NAME}] Scelta utente: interrompi script.")
             return "abort"
         print(f"{RED}[!] Scelta non valida.{RESET}")
 
@@ -247,21 +246,19 @@ def attendi_brani_in_cartella_music(music_dir: Path, logger: logging.Logger) -> 
             logger.warning(f"[{SCRIPT_NAME}] Nessun file audio trovato in 'MUSIC/' ({', '.join(AUDIO_EXTS)}).")
             avvisato_log = True
 
-        print(f"\n{RED}{BOLD}[X] Nessun brano trovato nella cartella 'MUSIC/' ({', '.join(AUDIO_EXTS)}).{RESET}")
-        print(f"{YELLOW}[!] Inserisci almeno un file audio nella cartella 'MUSIC/' e riavvio lo script.{RESET}")
+        print(f"\n{RED}{BOLD}[X] [{SCRIPT_NAME}] Nessun brano trovato nella cartella 'MUSIC/' ({', '.join(AUDIO_EXTS)}).{RESET}", file=sys.stderr)
+        print(f"{YELLOW}[!] Inserisci almeno un file audio nella cartella 'MUSIC/' prima di proseguire.{RESET}")
         sc = input("\n👉 Premi [INVIO] per riavviare lo script (oppure '0' per uscire): ").strip().lower()
         if sc in ("0", "q", "quit", "exit"):
-            print(f"{YELLOW}[!] Elaborazione interrotta dall'utente.{RESET}")
+            print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
             logger.info(f"[{SCRIPT_NAME}] Uscita richiesta dall'utente per mancanza brani in MUSIC/.")
             sys.exit(1)
 
-        pulisci_console()
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def main():
     abilita_ansi()
-    pulisci_console()
 
     parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Mix musica di sottofondo sul video unito")
     parser.add_argument("--base-dir", default=".")
@@ -280,23 +277,24 @@ def main():
     if fmt_slug not in ("1080P", "REEL"):
         fmt_slug = "1080P"
 
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}")
-    print(f" {BOLD}{GREEN}INIZIO: {SCRIPT_NAME}{RESET} | Tipo: {BOLD}{args.tipo}{RESET} | Formato: {BOLD}{fmt_slug}{RESET}")
-    print(f" {YELLOW}[CPU/RAM]{RESET} Thread: {res['threads']} | RAM disp.: {res['ram_avail']}/{res['ram_tot']} GB | Audio: Musica {int(MUSIC_VOLUME*100)}% / Orig {int(ORIGINAL_AUDIO_VOLUME*100)}%")
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}\n")
-    logger.info(f"[{SCRIPT_NAME}] Avvio | tipo={args.tipo} | formato={fmt_slug} | risorse={res}")
+    logger.info(
+        f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | formato='{fmt_slug}' | "
+        f"auto={args.auto} | vol_music={MUSIC_VOLUME} | vol_orig={ORIGINAL_AUDIO_VOLUME} | risorse={res}"
+    )
 
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        print(f"{RED}[X] FFmpeg o FFprobe non trovati nel PATH.{RESET}")
+        print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.")
         sys.exit(1)
 
     in_video = select_input_video(dirs["out"], dirs["final"], dirs["tmp"], args.tipo, tipo_slug, fmt_slug, args.auto)
     if not in_video or not in_video.is_file():
         if is_non_highlights_mode(args.tipo):
-            print(f"{RED}[X] Video sorgente 'OUT/{tipo_slug}_1080P_merged_orig.mp4' non trovato.{RESET}")
+            msg = f"Video sorgente 'OUT/{tipo_slug}_1080P_merged_orig.mp4' non trovato."
         else:
-            print(f"{RED}[X] Nessun video unito trovato in 'FINAL/' o 'TMP/'.{RESET}")
-        logger.error(f"[{SCRIPT_NAME}] Nessun video unito trovato.")
+            msg = "Nessun video unito trovato in 'FINAL/' o 'TMP/'."
+        print(f"{RED}[X] [{SCRIPT_NAME}] {msg}{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] {msg}")
         sys.exit(1)
 
     fade_flag = extract_fade_flag(in_video, default_fade=True)
@@ -304,20 +302,24 @@ def main():
     out_file = dirs["final"] / stage_name
     tmp_out_file = dirs["tmp"] / stage_name
 
+    logger.info(f"[{SCRIPT_NAME}] Video input='{in_video}' | fade={fade_flag} | out_file='{out_file}'")
+
     azione = gestione_file_esistente(out_file, args.auto, logger)
     if azione == "abort":
-        print(f"{YELLOW}[!] Elaborazione interrotta dall'utente.{RESET}")
+        print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
         return
     if azione == "skip":
-        print(f"{GREEN}[✔] Mantenuto file esistente: '{out_file}'{RESET}")
+        logger.info(f"[{SCRIPT_NAME}] Completato (SKIP): mantenuto '{out_file}'.")
         return
 
     music_files = attendi_brani_in_cartella_music(dirs["music"], logger)
     selected_music = music_files[0]
     total_ms = get_duration_ms(in_video)
+    logger.info(f"[{SCRIPT_NAME}] Traccia audio selezionata='{selected_music}' | durata_video_ms={total_ms}")
 
     cmd = [
         "ffmpeg",
+        "-loglevel", "error",
         "-i", str(in_video),
         "-stream_loop", "-1",
         "-i", str(selected_music),
@@ -335,6 +337,7 @@ def main():
         "-y",
         str(tmp_out_file),
     ]
+    logger.info(f"[{SCRIPT_NAME}] Esecuzione FFmpeg: {cmd}")
 
     stderr_lines: list[str] = []
 
@@ -356,7 +359,7 @@ def main():
             t_err.start()
 
         last_ms = 0
-        with tqdm(total=max(1, total_ms), desc="Mix Musica", unit="ms", unit_scale=True, colour="green", ncols=78) as bar:
+        with tqdm(total=max(1, total_ms), desc="07 | Mix Musica", unit="ms", unit_scale=True, colour="green", ncols=78) as bar:
             if proc.stdout:
                 for raw in iter(proc.stdout.readline, ""):
                     line = raw.strip()
@@ -374,17 +377,14 @@ def main():
         t_err.join(timeout=5.0)
 
         if rc != 0 or not tmp_out_file.is_file() or tmp_out_file.stat().st_size == 0:
-            print(f"\n{RED}[X] Errore durante il mix audio con FFmpeg.{RESET}")
-            logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg (rc={rc}): {' '.join(stderr_lines[-5:])}")
+            err_msg = " ".join(stderr_lines[-8:]) or f"returncode={rc}"
+            print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore durante il mix audio con FFmpeg (log: {log_file.name}).{RESET}", file=sys.stderr)
+            logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg (rc={rc}): {err_msg}")
             sys.exit(1)
 
         shutil.move(str(tmp_out_file), str(out_file))
-        print(f"\n{GREEN}[✔] Mix audio completato con successo!{RESET}")
-        print(f"    Video input   : '{in_video.name}'")
-        print(f"    Traccia audio : '{selected_music.name}'")
-        print(f"    Output finale : '{out_file}'")
-        print(f"    Log salvato   : '{log_file}'")
-        logger.info(f"[{SCRIPT_NAME}] Completato: {out_file} (musica={selected_music.name})")
+        size_mb = out_file.stat().st_size / (1024 * 1024)
+        logger.info(f"[{SCRIPT_NAME}] Completato con successo: '{out_file}' ({size_mb:.2f} MB, musica='{selected_music.name}')")
     finally:
         if tmp_out_file.exists():
             tmp_out_file.unlink(missing_ok=True)

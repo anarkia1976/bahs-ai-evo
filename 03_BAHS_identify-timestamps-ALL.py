@@ -36,10 +36,6 @@ def abilita_ansi():
             os.system("")
 
 
-def pulisci_console():
-    os.system("cls" if os.name == "nt" else "clear")
-
-
 def rileva_ram_gb() -> tuple[float, float]:
     try:
         import psutil  # type: ignore
@@ -157,32 +153,24 @@ def sincronizza_timestamp_generico(src_txt: Path, out_dir: Path, logger: logging
     if src_txt.resolve() == dst_txt.resolve():
         return dst_txt
     if dst_txt.is_file() and dst_txt.stat().st_size > 0 and leggi_timestamp_salvati(dst_txt):
-        print(f"{GREEN}[✔] Mantenuto file timestamp esistente: '{dst_txt}'{RESET}")
-        logger.info(f"[{SCRIPT_NAME}] Mantenuto file timestamp esistente '{dst_txt}'.")
+        logger.info(f"[{SCRIPT_NAME}] Mantenuto file timestamp generico esistente '{dst_txt}'.")
         return dst_txt
     if src_txt.is_file() and src_txt.stat().st_size > 0:
         shutil.copy2(src_txt, dst_txt)
-        print(f"{GREEN}[✔] Sincronizzato file timestamp generico per le clip: '{dst_txt}'{RESET}")
         logger.info(f"[{SCRIPT_NAME}] Copiato '{src_txt}' su '{dst_txt}'.")
     return dst_txt
 
 
-def controlla_e_stampa_timestamp_out(out_dir: Path, txt_path: Path, logger: logging.Logger) -> list[str]:
-    print(f"{CYAN}🔎 Controllo file e timestamp nella cartella '{out_dir.name}/'...{RESET}")
+def controlla_timestamp_out(out_dir: Path, txt_path: Path, logger: logging.Logger) -> list[str]:
     if not txt_path.is_file():
-        print(f"   {RED}[X] File timestamp '{txt_path.name}' NON PRESENTE nella cartella '{out_dir.name}/'.{RESET}")
-        print(f"   {YELLOW}[!] Timestamp salvati: NESSUNO (file assente).{RESET}\n")
-        logger.warning(f"[{SCRIPT_NAME}] File '{txt_path}' non presente nella cartella '{out_dir.name}/'.")
+        logger.info(f"[{SCRIPT_NAME}] File timestamp '{txt_path}' non presente in '{out_dir.name}/'.")
         return []
 
     saved_times = leggi_timestamp_salvati(txt_path)
-    print(f"   {GREEN}[✔] File timestamp '{txt_path.name}' PRESENTE nella cartella '{out_dir.name}/'.{RESET}")
     if saved_times:
-        print(f"   {GREEN}[✔] Timestamp salvati ({len(saved_times)}): {', '.join(saved_times)}{RESET}\n")
         logger.info(f"[{SCRIPT_NAME}] File '{txt_path}' presente con {len(saved_times)} timestamp: {saved_times}")
     else:
-        print(f"   {YELLOW}[!] Nessun timestamp salvato all'interno di '{txt_path.name}' (file vuoto o senza voci valide).{RESET}\n")
-        logger.warning(f"[{SCRIPT_NAME}] File '{txt_path}' presente ma senza timestamp salvati.")
+        logger.warning(f"[{SCRIPT_NAME}] File '{txt_path}' presente ma privo di timestamp validi.")
     return saved_times
 
 
@@ -283,7 +271,6 @@ def porta_in_primo_piano(window_title: str):
 
 def main():
     abilita_ansi()
-    pulisci_console()
 
     parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Identificazione interattiva timestamp canestri")
     parser.add_argument("--base-dir", default=".")
@@ -304,11 +291,10 @@ def main():
 
     default_session = f"{tipo_slug}_{fmt_slug}_{sanitize_slug(args.sottotitolo)}"
 
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}")
-    print(f" {BOLD}{GREEN}INIZIO: {SCRIPT_NAME}{RESET} | Tipo: {BOLD}{args.tipo}{RESET} | Formato: {BOLD}{fmt_slug}{RESET}")
-    print(f" {YELLOW}[CPU/RAM]{RESET} Thread: {res['threads']} | RAM disp.: {res['ram_avail']}/{res['ram_tot']} GB | Worker: {res['max_workers']}")
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}\n")
-    logger.info(f"[{SCRIPT_NAME}] Avvio | tipo={args.tipo} | sottotitolo={args.sottotitolo} | formato={fmt_slug} | risorse={res}")
+    logger.info(
+        f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | "
+        f"sottotitolo='{args.sottotitolo}' | formato='{fmt_slug}' | auto={args.auto} | risorse={res}"
+    )
 
     generic_txt = risolvi_file_timestamp_generico(dirs["out"])
     if tipo_slug.upper() == "HIGHLIGHTS" and fmt_slug == "REEL" and generic_txt.is_file() and leggi_timestamp_salvati(generic_txt):
@@ -316,18 +302,15 @@ def main():
     else:
         txt_path = risolvi_file_timestamp(dirs["out"], tipo_slug, fmt_slug)
 
-    existing_timestamps = controlla_e_stampa_timestamp_out(dirs["out"], txt_path, logger)
+    existing_timestamps = controlla_timestamp_out(dirs["out"], txt_path, logger)
 
     session_raw = input(f"🏷️  Etichetta sessione [INVIO = {default_session}]: ").strip()
     session_label = session_raw if session_raw else default_session
+    logger.info(f"[{SCRIPT_NAME}] Sessione impostata: '{session_label}' | target_txt='{txt_path}'")
 
     if txt_path.is_file() and txt_path.stat().st_size > 0:
-        print(f"\n{YELLOW}[!] ATTENZIONE: Attività già svolta! File '{txt_path.name}' già presente in 'OUT/'.{RESET}")
-        if existing_timestamps:
-            print(f"{GREEN}    Timestamp attualmente salvati ({len(existing_timestamps)}): {', '.join(existing_timestamps)}{RESET}")
-        else:
-            print(f"{YELLOW}    Nessun timestamp valido attualmente salvato in '{txt_path.name}'.{RESET}")
-        logger.warning(f"[{SCRIPT_NAME}] File '{txt_path}' già esistente.")
+        logger.warning(f"[{SCRIPT_NAME}] File timestamp '{txt_path}' già esistente (voci={len(existing_timestamps)}).")
+        print(f"\n{YELLOW}[!] ATTENZIONE: File '{txt_path.name}' già presente in 'OUT/' ({len(existing_timestamps)} timestamp).{RESET}")
         print("   1. Sovrascrivi e registra nuovi timestamp")
         print("   2. Salta (mantieni timestamp esistenti)")
         print("   3. Interrompi script")
@@ -336,14 +319,14 @@ def main():
             if sc in ("", "2"):
                 if existing_timestamps:
                     sincronizza_timestamp_generico(txt_path, dirs["out"], logger)
-                    print(f"{GREEN}[✔] Mantenuto file timestamp esistente: '{txt_path}' | Timestamp: {', '.join(existing_timestamps)}{RESET}")
-                else:
-                    print(f"{YELLOW}[!] Mantenuto file timestamp esistente: '{txt_path}' (nessun timestamp salvato).{RESET}")
+                logger.info(f"[{SCRIPT_NAME}] Completato (SKIP): mantenuto '{txt_path}'.")
                 return
             if sc == "1":
+                logger.info(f"[{SCRIPT_NAME}] Scelta utente: sovrascrittura '{txt_path}'.")
                 break
             if sc == "3":
-                print(f"{YELLOW}[!] Elaborazione interrotta dall'utente.{RESET}")
+                print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
+                logger.info(f"[{SCRIPT_NAME}] Interrotto dall'utente su file esistente.")
                 return
             print(f"{RED}[!] Scelta non valida.{RESET}")
 
@@ -351,16 +334,17 @@ def main():
     video_name = input(f"📁 Nome video in 'OUT/' [INVIO = {default_video_name}]: ").strip()
     video_path = risolvi_video_out(dirs["out"], tipo_slug, fmt_slug, video_name or None)
     if not video_path:
-        print(f"{RED}[X] Video non trovato in 'OUT/': {video_name or default_video_name}{RESET}")
-        logger.error(f"[{SCRIPT_NAME}] Video non trovato in OUT.")
+        print(f"{RED}[X] [{SCRIPT_NAME}] Video non trovato in 'OUT/': {video_name or default_video_name}{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] Video non trovato in OUT (richiesto='{video_name or default_video_name}').")
         sys.exit(1)
 
     speed = chiedi_velocita(default_speed=DEFAULT_SPEED)
+    logger.info(f"[{SCRIPT_NAME}] Video sorgente='{video_path}' | velocità={speed:g}x")
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        print(f"{RED}[X] Impossibile aprire il video: {video_path}{RESET}")
-        logger.error(f"[{SCRIPT_NAME}] Impossibile aprire {video_path}")
+        print(f"{RED}[X] [{SCRIPT_NAME}] Impossibile aprire il video: {video_path}{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] Impossibile aprire video '{video_path}' con OpenCV.")
         sys.exit(1)
 
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -368,16 +352,16 @@ def main():
         fps = 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     total_sec = total_frames / fps if fps > 0 else 0.0
+    logger.info(f"[{SCRIPT_NAME}] Metadati video: fps={fps:.2f} | frames={total_frames} | durata={total_sec:.2f}s")
 
-    print(f"\n{CYAN}🎮 CONTROLLI TASTIERA:{RESET}")
-    print("   [BARRA SPAZIO] -> Registra canestro | [P] -> Pausa/Riprendi | [F/R] -> ±5s | [Q] -> Salva ed Esci")
-    input(f"\n{BOLD}{GREEN}👉 Premi [INVIO] per aprire il video a schermo intero... {RESET}")
+    input("Controlli: [SPAZIO]=Canestro | [P]=Pausa | [F/R]=±5s | [Q]=Salva/Esci. INVIO=Avvia ")
 
     ret, current_frame = cap.read()
     if not ret or current_frame is None:
         cap.release()
         cv2.destroyAllWindows()
-        print(f"{RED}[X] Impossibile leggere il primo fotogramma.{RESET}")
+        print(f"{RED}[X] [{SCRIPT_NAME}] Impossibile leggere il primo fotogramma da '{video_path.name}'.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] Errore lettura primo fotogramma da '{video_path}'.")
         sys.exit(1)
 
     recorded_times: list[str] = []
@@ -397,7 +381,7 @@ def main():
     anchor_wall = time.perf_counter()
     anchor_vid = 0.0
 
-    with tqdm(total=max(1, total_frames), desc="Analisi Video", unit="frame", colour="blue", ncols=78) as pbar:
+    with tqdm(total=max(1, total_frames), desc="03 | Analisi Video", unit="frame", colour="blue", ncols=78) as pbar:
         try:
             while cap.isOpened():
                 if not paused:
@@ -441,6 +425,7 @@ def main():
 
                 key = cv2.waitKey(wait_ms) & 0xFF
                 if key in (ord("q"), ord("Q")):
+                    logger.info(f"[{SCRIPT_NAME}] Uscita dal player tramite tasto Q al frame {current_frame_idx} ({seconds_to_time_str(current_sec)}).")
                     break
                 elif key in (ord("p"), ord("P")):
                     paused = not paused
@@ -453,8 +438,6 @@ def main():
                     target_frame = min(max(0, total_frames - 1), max(0, int(round(target_sec * fps))))
                     cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
                     ret, frame = cap.read()
-                    if ret and frame is None:
-                        continue
                     if ret and frame is not None:
                         current_frame = frame
                         current_frame_idx = target_frame
@@ -478,7 +461,7 @@ def main():
                         recorded_times.append(t_str)
                         flash_timer = time.time() + 0.6
                         pbar.set_postfix({"canestri": len(recorded_times)})
-                        logger.info(f"[{SCRIPT_NAME}] Registrato timestamp: {t_str}")
+                        logger.info(f"[{SCRIPT_NAME}] Registrato timestamp: {t_str} (frame={current_frame_idx})")
         finally:
             cap.release()
             cv2.destroyAllWindows()
@@ -486,12 +469,11 @@ def main():
     if recorded_times:
         content = f"# Sessione: {session_label} | Script: {SCRIPT_NAME}\n" + "\n".join(recorded_times) + "\n"
         txt_path.write_text(content, encoding="utf-8")
-        print(f"\n{GREEN}[✔] Salvati {len(recorded_times)} timestamp in '{txt_path}': {', '.join(recorded_times)}{RESET}")
         logger.info(f"[{SCRIPT_NAME}] Salvati {len(recorded_times)} timestamp in '{txt_path}': {recorded_times}")
         sincronizza_timestamp_generico(txt_path, dirs["out"], logger)
     else:
-        print(f"\n{YELLOW}[!] Nessun timestamp registrato.{RESET}")
-        logger.warning(f"[{SCRIPT_NAME}] Nessun timestamp registrato.")
+        print(f"{YELLOW}[!] [{SCRIPT_NAME}] Nessun timestamp registrato (log: {log_file.name}).{RESET}", file=sys.stderr)
+        logger.warning(f"[{SCRIPT_NAME}] Sessione terminata senza timestamp registrati.")
 
 
 if __name__ == "__main__":

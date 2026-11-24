@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 SCRIPT_NAME = "06_BAHS_merge-clips-ALL"
 FADE_DURATION = 1.0
+MAX_LINE_WIDTH = 80
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -31,10 +32,6 @@ def abilita_ansi():
                 k.SetConsoleMode(h, m.value | 0x0004)
         except Exception:
             os.system("")
-
-
-def pulisci_console():
-    os.system("cls" if os.name == "nt" else "clear")
 
 
 def rileva_ram_gb() -> tuple[float, float]:
@@ -103,6 +100,14 @@ def sanitize_slug(text: str) -> str:
     while "__" in cleaned:
         cleaned = cleaned.replace("__", "_")
     return cleaned.strip("_") or "INCONTRO"
+
+
+def format_clip_label(clip_path: Path) -> str:
+    stem = clip_path.stem
+    parts = stem.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].replace("-", "").isdigit() and "-" in parts[1]:
+        return parts[0]
+    return stem
 
 
 def build_stage_name(tipo_slug: str, fmt_slug: str, fade: bool = True, music: bool = False, text: bool = False, logo: bool = False) -> str:
@@ -174,7 +179,7 @@ def trova_clip_formato(out_dir: Path, tipo_slug: str, fmt_slug: str) -> list[Pat
     return [p for p in all_legacy if not p.stem.lower().endswith("_reel")]
 
 
-def normalize_clip(src: Path, dst: Path, is_first: bool, is_last: bool, duration: float, use_fade: bool, res: dict) -> bool:
+def normalize_clip(src: Path, dst: Path, is_first: bool, is_last: bool, duration: float, use_fade: bool, res: dict, logger: logging.Logger) -> tuple[bool, str]:
     vf = "fps=30,format=yuv420p"
     af = "aresample=48000,aformat=channel_layouts=stereo"
     if use_fade and is_first and duration > FADE_DURATION:
@@ -186,7 +191,9 @@ def normalize_clip(src: Path, dst: Path, is_first: bool, is_last: bool, duration
         af += f",afade=t=out:st={st_out}:d={FADE_DURATION}"
 
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-loglevel", "error",
+        "-y",
         "-i", str(src),
         "-vf", vf,
         "-af", af,
@@ -199,35 +206,42 @@ def normalize_clip(src: Path, dst: Path, is_first: bool, is_last: bool, duration
         str(dst),
     ]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return proc.returncode == 0
+    if proc.returncode == 0 and dst.is_file() and dst.stat().st_size > 0:
+        logger.info(f"[{SCRIPT_NAME}] Normalizzata clip '{src.name}' -> '{dst.name}' (dur={duration:.2f}s)")
+        return True, ""
+    err_detail = proc.stderr.strip() or f"returncode={proc.returncode}"
+    logger.error(f"[{SCRIPT_NAME}] Errore normalizzazione '{src.name}' (rc={proc.returncode}): {err_detail}")
+    return False, err_detail
 
 
 def gestione_file_esistente(out_file: Path, auto: bool, logger: logging.Logger) -> str:
     if not out_file.is_file() or out_file.stat().st_size == 0:
         return "overwrite"
     size_mb = out_file.stat().st_size / (1024 * 1024)
-    print(f"\n{YELLOW}[!] ATTENZIONE: Attività già svolta! File esistente: 'FINAL/{out_file.name}' ({size_mb:.1f} MB){RESET}")
-    logger.warning(f"[{SCRIPT_NAME}] File già esistente: {out_file}")
+    logger.warning(f"[{SCRIPT_NAME}] File già esistente: '{out_file}' ({size_mb:.1f} MB)")
     if auto:
-        print(f"{DIM}   Modalità AUTO: unione clip già svolta, salto passaggio.{RESET}")
+        logger.info(f"[{SCRIPT_NAME}] Modalità AUTO: file esistente mantenuto, step saltato.")
         return "skip"
+    print(f"\n{YELLOW}[!] ATTENZIONE: File esistente: 'FINAL/{out_file.name}' ({size_mb:.1f} MB){RESET}")
     print("   1. Sovrascrivi e rigenera")
     print("   2. Salta (mantieni file esistente)")
     print("   3. Interrompi script")
     while True:
         sc = input("👉 Scelta [INVIO = 2 Salta]: ").strip()
         if sc in ("", "2"):
+            logger.info(f"[{SCRIPT_NAME}] Scelta utente: mantieni file esistente.")
             return "skip"
         if sc == "1":
+            logger.info(f"[{SCRIPT_NAME}] Scelta utente: sovrascrivi file esistente.")
             return "overwrite"
         if sc == "3":
+            logger.info(f"[{SCRIPT_NAME}] Scelta utente: interrompi script.")
             return "abort"
         print(f"{RED}[!] Scelta non valida.{RESET}")
 
 
 def main():
     abilita_ansi()
-    pulisci_console()
 
     parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Unione clip 1080P o REEL con transizioni")
     parser.add_argument("--base-dir", default=".")
@@ -262,29 +276,31 @@ def main():
     out_file = dirs["final"] / stage_name
     tmp_out_file = dirs["tmp"] / stage_name
 
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}")
-    print(f" {BOLD}{GREEN}INIZIO: {SCRIPT_NAME}{RESET} | Tipo: {BOLD}{args.tipo}{RESET} | Formato: {BOLD}{fmt_slug}{RESET} | Fade: {BOLD}{'ON' if use_fade else 'OFF'}{RESET}")
-    print(f" {YELLOW}[CPU/RAM]{RESET} Thread: {res['threads']} | RAM disp.: {res['ram_avail']}/{res['ram_tot']} GB | Preset: {res['preset']}")
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}\n")
-    logger.info(f"[{SCRIPT_NAME}] Avvio | tipo={args.tipo} | formato={fmt_slug} | fade={use_fade} | risorse={res}")
+    logger.info(
+        f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | formato='{fmt_slug}' | "
+        f"fade={use_fade} | auto={args.auto} | out_file='{out_file}' | risorse={res}"
+    )
 
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        print(f"{RED}[X] FFmpeg o FFprobe non trovati nel PATH.{RESET}")
+        print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.")
         sys.exit(1)
 
     azione = gestione_file_esistente(out_file, args.auto, logger)
     if azione == "abort":
-        print(f"{YELLOW}[!] Elaborazione interrotta dall'utente.{RESET}")
+        print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
         return
     if azione == "skip":
-        print(f"{GREEN}[✔] Mantenuto file esistente: '{out_file}'{RESET}")
+        logger.info(f"[{SCRIPT_NAME}] Completato (SKIP): mantenuto '{out_file}'.")
         return
 
     selected_clips = trova_clip_formato(dirs["out"], tipo_slug, fmt_slug)
     if not selected_clips:
-        print(f"{RED}[X] Nessuna clip {fmt_slug} per '{tipo_slug}' trovata in 'OUT/'.{RESET}")
-        logger.error(f"[{SCRIPT_NAME}] Nessuna clip {fmt_slug} in OUT.")
+        print(f"{RED}[X] [{SCRIPT_NAME}] Nessuna clip {fmt_slug} per '{tipo_slug}' trovata in 'OUT/'.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] Nessuna clip {fmt_slug} per '{tipo_slug}' trovata in '{dirs['out']}'.")
         sys.exit(1)
+
+    logger.info(f"[{SCRIPT_NAME}] Trovate {len(selected_clips)} clip {fmt_slug} da unire: {[c.name for c in selected_clips]}")
 
     step_tmp_dir = dirs["tmp"] / f"merge_{tipo_slug}_{fmt_slug}"
     step_tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -292,88 +308,102 @@ def main():
     try:
         norm_items: list[dict] = []
         total_n = len(selected_clips)
-        with tqdm(enumerate(selected_clips), total=total_n, desc="Normalizzazione", unit="clip", colour="blue", ncols=78) as bar1:
-            for idx, clip_p in bar1:
+        total_steps = total_n + 1
+
+        with tqdm(
+            total=total_steps,
+            desc=f"06 | Unione Clip {fmt_slug}",
+            unit="step",
+            colour="green",
+            ncols=MAX_LINE_WIDTH,
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} - {postfix}",
+        ) as bar:
+            for idx, clip_p in enumerate(selected_clips):
+                bar.set_postfix_str(format_clip_label(clip_p))
                 dst_p = step_tmp_dir / f"norm_{idx:03d}.mp4"
                 dur = get_duration(clip_p)
-                if not normalize_clip(clip_p, dst_p, idx == 0, idx == total_n - 1, dur, use_fade, res):
-                    print(f"\n{RED}[X] Errore normalizzazione clip: {clip_p.name}{RESET}")
-                    logger.error(f"[{SCRIPT_NAME}] Errore normalizzazione {clip_p.name}")
+                ok_norm, err_norm = normalize_clip(clip_p, dst_p, idx == 0, idx == total_n - 1, dur, use_fade, res, logger)
+                if not ok_norm:
+                    print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore normalizzazione clip '{clip_p.name}' (log: {log_file.name}).{RESET}", file=sys.stderr)
                     sys.exit(1)
                 norm_items.append({"path": dst_p, "duration": get_duration(dst_p)})
+                bar.update(1)
 
-        if len(norm_items) == 1:
-            shutil.copy2(norm_items[0]["path"], tmp_out_file)
-        elif not use_fade:
-            concat_txt = step_tmp_dir / "concat_nofade.txt"
-            with open(concat_txt, "w", encoding="utf-8") as f:
-                for it in norm_items:
-                    f.write(f"file '{it['path'].resolve().as_posix()}'\n")
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", str(concat_txt),
-                "-c:v", "libx264",
-                "-crf", "18",
-                "-preset", res["preset"],
-                "-threads", str(res["threads"]),
-                "-c:a", "aac",
-                "-b:a", "192k",
-                str(tmp_out_file),
-            ]
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if proc.returncode != 0 or not tmp_out_file.is_file() or tmp_out_file.stat().st_size == 0:
-                print(f"\n{RED}[X] Errore durante l'unione senza fade con FFmpeg.{RESET}")
-                logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg nofade: {proc.stderr.strip()}")
-                sys.exit(1)
-        else:
-            cmd = ["ffmpeg", "-y"]
-            for item in norm_items:
-                cmd.extend(["-i", str(item["path"])])
-
-            fc_parts = []
-            cur_dur = norm_items[0]["duration"]
-            for i in range(len(norm_items) - 1):
-                nxt_dur = norm_items[i + 1]["duration"]
-                offset = max(0.0, cur_dur - FADE_DURATION)
-                v1 = f"[{i}:v]" if i == 0 else f"[v{i}]"
-                v2 = f"[{i + 1}:v]"
-                vo = f"[v{i + 1}]" if i < len(norm_items) - 2 else "[vout]"
-                a1 = f"[{i}:a]" if i == 0 else f"[a{i}]"
-                a2 = f"[{i + 1}:a]"
-                ao = f"[a{i + 1}]" if i < len(norm_items) - 2 else "[aout]"
-                fc_parts.append(f"{v1}{v2}xfade=transition=fade:duration={FADE_DURATION}:offset={offset:.3f}{vo}")
-                fc_parts.append(f"{a1}{a2}acrossfade=d={FADE_DURATION}{ao}")
-                cur_dur = offset + nxt_dur
-
-            cmd.extend([
-                "-filter_complex", ";".join(fc_parts),
-                "-map", "[vout]",
-                "-map", "[aout]",
-                "-c:v", "libx264",
-                "-crf", "18",
-                "-preset", res["preset"],
-                "-threads", str(res["threads"]),
-                "-c:a", "aac",
-                "-b:a", "192k",
-                str(tmp_out_file),
-            ])
-
-            with tqdm(total=100, desc="Unione Transizioni", unit="%", colour="green", ncols=78) as bar2:
-                bar2.update(25)
+            bar.set_postfix_str(Path(tmp_out_file.name).stem)
+            if len(norm_items) == 1:
+                shutil.copy2(norm_items[0]["path"], tmp_out_file)
+                logger.info(f"[{SCRIPT_NAME}] Singola clip copiata direttamente in '{tmp_out_file}'.")
+            elif not use_fade:
+                concat_txt = step_tmp_dir / "concat_nofade.txt"
+                with open(concat_txt, "w", encoding="utf-8") as f:
+                    for it in norm_items:
+                        f.write(f"file '{it['path'].resolve().as_posix()}'\n")
+                cmd = [
+                    "ffmpeg",
+                    "-loglevel", "error",
+                    "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", str(concat_txt),
+                    "-c:v", "libx264",
+                    "-crf", "18",
+                    "-preset", res["preset"],
+                    "-threads", str(res["threads"]),
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    str(tmp_out_file),
+                ]
+                logger.info(f"[{SCRIPT_NAME}] Esecuzione FFmpeg nofade: {cmd}")
                 proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                bar2.update(75)
+                if proc.returncode != 0 or not tmp_out_file.is_file() or tmp_out_file.stat().st_size == 0:
+                    print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore durante l'unione senza fade con FFmpeg (log: {log_file.name}).{RESET}", file=sys.stderr)
+                    logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg nofade (rc={proc.returncode}): {proc.stderr.strip()}")
+                    sys.exit(1)
+            else:
+                cmd = ["ffmpeg", "-loglevel", "error", "-y"]
+                for item in norm_items:
+                    cmd.extend(["-i", str(item["path"])])
 
-            if proc.returncode != 0 or not tmp_out_file.is_file() or tmp_out_file.stat().st_size == 0:
-                print(f"\n{RED}[X] Errore durante l'unione finale con FFmpeg.{RESET}")
-                logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg: {proc.stderr.strip()}")
-                sys.exit(1)
+                fc_parts = []
+                cur_dur = norm_items[0]["duration"]
+                for i in range(len(norm_items) - 1):
+                    nxt_dur = norm_items[i + 1]["duration"]
+                    offset = max(0.0, cur_dur - FADE_DURATION)
+                    v1 = f"[{i}:v]" if i == 0 else f"[v{i}]"
+                    v2 = f"[{i + 1}:v]"
+                    vo = f"[v{i + 1}]" if i < len(norm_items) - 2 else "[vout]"
+                    a1 = f"[{i}:a]" if i == 0 else f"[a{i}]"
+                    a2 = f"[{i + 1}:a]"
+                    ao = f"[a{i + 1}]" if i < len(norm_items) - 2 else "[aout]"
+                    fc_parts.append(f"{v1}{v2}xfade=transition=fade:duration={FADE_DURATION}:offset={offset:.3f}{vo}")
+                    fc_parts.append(f"{a1}{a2}acrossfade=d={FADE_DURATION}{ao}")
+                    cur_dur = offset + nxt_dur
+
+                cmd.extend([
+                    "-filter_complex", ";".join(fc_parts),
+                    "-map", "[vout]",
+                    "-map", "[aout]",
+                    "-c:v", "libx264",
+                    "-crf", "18",
+                    "-preset", res["preset"],
+                    "-threads", str(res["threads"]),
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    str(tmp_out_file),
+                ])
+                logger.info(f"[{SCRIPT_NAME}] Esecuzione FFmpeg xfade ({len(norm_items)} clip).")
+
+                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if proc.returncode != 0 or not tmp_out_file.is_file() or tmp_out_file.stat().st_size == 0:
+                    print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore durante l'unione finale con FFmpeg (log: {log_file.name}).{RESET}", file=sys.stderr)
+                    logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg xfade (rc={proc.returncode}): {proc.stderr.strip()}")
+                    sys.exit(1)
+
+            bar.update(1)
 
         shutil.move(str(tmp_out_file), str(out_file))
-        print(f"\n{GREEN}[✔] Clip unite con successo! Output: '{out_file}'{RESET}")
-        print(f"    Log salvato: '{log_file}'")
-        logger.info(f"[{SCRIPT_NAME}] Completato: {out_file}")
+        size_mb = out_file.stat().st_size / (1024 * 1024)
+        logger.info(f"[{SCRIPT_NAME}] Completato con successo: '{out_file}' ({size_mb:.2f} MB)")
 
     finally:
         if tmp_out_file.exists():

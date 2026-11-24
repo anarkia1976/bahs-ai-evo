@@ -18,6 +18,7 @@ BALL_KEYWORDS = ("sports ball", "basketball", "ball")
 MODEL_EXTS = {".pt", ".onnx", ".engine", ".tflite", ".pb"}
 UNIFORM_CLIP_RE = re.compile(r"^.+_(?:1080P|REEL)_clip_\d{2}_(?:\d{1,2}-)?\d{1,2}-\d{2}\.mp4$", re.IGNORECASE)
 LEGACY_CLIP_RE = re.compile(r"^canestro_\d{2}_(?:\d{1,2}-)?\d{1,2}-\d{2}(?:_[A-Za-z0-9_-]+)?\.mp4$", re.IGNORECASE)
+TIMESTAMP_SUFFIX_RE = re.compile(r"_(?:\d{1,2}-)?\d{1,2}-\d{2}(?:_[A-Za-z0-9_-]+)?$", re.IGNORECASE)
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -38,10 +39,6 @@ def abilita_ansi():
                 k.SetConsoleMode(h, m.value | 0x0004)
         except Exception:
             os.system("")
-
-
-def pulisci_console():
-    os.system("cls" if os.name == "nt" else "clear")
 
 
 def rileva_ram_gb() -> tuple[float, float]:
@@ -151,6 +148,11 @@ def build_reel_clip_name(clip_path: Path, tipo_slug: str) -> str:
     return f"{tipo_slug}_REEL_{clip_path.stem}.mp4"
 
 
+def short_clip_name(clip_path: Path, tipo_slug: str) -> str:
+    reel_stem = Path(build_reel_clip_name(clip_path, tipo_slug)).stem
+    return TIMESTAMP_SUFFIX_RE.sub("", reel_stem)
+
+
 def trova_clip_sorgente(out_dir: Path, tipo_slug: str) -> list[Path]:
     prefixes = (f"{tipo_slug}_1080P_clip_", f"{tipo_slug}_REEL_clip_")
     uniform_matches = sorted([
@@ -191,7 +193,6 @@ def resolve_model(model_arg: str, model_dir: Path, base_dir: Path, logger: loggi
     target = model_dir / model_filename
 
     if target.is_file() and target.stat().st_size > 0:
-        print(f"{GREEN}[✔] Modello YOLO trovato in 'EXTRA/MODEL/': '{target.name}'{RESET}")
         logger.info(f"[{SCRIPT_NAME}][YOLO-MODEL] Caricamento modello locale da '{target}'.")
         model = YOLO(str(target))
         log_model_info(model, target, logger)
@@ -206,13 +207,11 @@ def resolve_model(model_arg: str, model_dir: Path, base_dir: Path, logger: loggi
     for cand in src_candidates:
         if cand and cand.is_file() and cand.stat().st_size > 0 and cand.resolve() != target.resolve():
             shutil.copy2(cand, target)
-            print(f"{GREEN}[✔] Modello YOLO copiato in 'EXTRA/MODEL/': '{target.name}'{RESET}")
             logger.info(f"[{SCRIPT_NAME}][YOLO-MODEL] Copiato modello '{cand}' in '{target}'.")
             model = YOLO(str(target))
             log_model_info(model, target, logger)
             return model, target
 
-    print(f"{CYAN}⬇️  Download modello YOLO '{model_filename}' nella cartella 'EXTRA/MODEL/'...{RESET}")
     logger.info(f"[{SCRIPT_NAME}][YOLO-MODEL] Download modello '{model_filename}' in '{model_dir}'...")
 
     prev_cwd = Path.cwd()
@@ -230,7 +229,6 @@ def resolve_model(model_arg: str, model_dir: Path, base_dir: Path, logger: loggi
     if not target.is_file() or target.stat().st_size == 0:
         raise FileNotFoundError(f"Modello '{model_filename}' non disponibile in '{model_dir}' dopo il download.")
 
-    print(f"{GREEN}[✔] Modello YOLO pronto in 'EXTRA/MODEL/': '{target.name}'{RESET}")
     logger.info(f"[{SCRIPT_NAME}][YOLO-MODEL] Modello scaricato e pronto in '{target}'.")
     model = YOLO(str(target))
     log_model_info(model, target, logger)
@@ -322,29 +320,27 @@ def convert_single_clip(
     match_confs: list[float] = []
     total_boxes_all_classes = 0
 
-    with tqdm(total=max(1, total_frames), desc=f"Track {input_path.name}", unit="frm", colour="cyan", ncols=90, leave=False) as b1:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            results = model.predict(frame, conf=conf, imgsz=imgsz, verbose=False) if imgsz else model.predict(frame, conf=conf, verbose=False)
-            best_x = None
-            best_c = 0.0
-            for r in results:
-                if r.boxes is None:
-                    continue
-                total_boxes_all_classes += len(r.boxes)
-                for box in r.boxes:
-                    cid = int(box.cls[0].item())
-                    c = float(box.conf[0].item())
-                    if cid == ball_cls_id and c > best_c:
-                        x1, _, x2, _ = box.xyxy[0].tolist()
-                        best_x = (x1 + x2) / 2.0
-                        best_c = c
-            if best_x is not None:
-                match_confs.append(best_c)
-            raw_x.append(best_x)
-            b1.update(1)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        results = model.predict(frame, conf=conf, imgsz=imgsz, verbose=False) if imgsz else model.predict(frame, conf=conf, verbose=False)
+        best_x = None
+        best_c = 0.0
+        for r in results:
+            if r.boxes is None:
+                continue
+            total_boxes_all_classes += len(r.boxes)
+            for box in r.boxes:
+                cid = int(box.cls[0].item())
+                c = float(box.conf[0].item())
+                if cid == ball_cls_id and c > best_c:
+                    x1, _, x2, _ = box.xyxy[0].tolist()
+                    best_x = (x1 + x2) / 2.0
+                    best_c = c
+        if best_x is not None:
+            match_confs.append(best_c)
+        raw_x.append(best_x)
     cap.release()
 
     analyzed_frames = len(raw_x)
@@ -376,25 +372,25 @@ def convert_single_clip(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(tmp_silent), fourcc, fps, (out_w, out_h))
 
-    with tqdm(total=max(1, total_frames), desc=f"Crop {input_path.name}", unit="frm", colour="green", ncols=90, leave=False) as b2:
-        idx = 0
-        while True:
-            ret, frame = cap2.read()
-            if not ret:
-                break
-            cx = smooth_x[idx] if idx < len(smooth_x) else src_w / 2.0
-            x1 = max(0, min(int(round(cx - half_w)), src_w - crop_w))
-            cropped = frame[0:crop_h, x1:x1 + crop_w]
-            resized = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
-            writer.write(resized)
-            idx += 1
-            b2.update(1)
+    idx = 0
+    while True:
+        ret, frame = cap2.read()
+        if not ret:
+            break
+        cx = smooth_x[idx] if idx < len(smooth_x) else src_w / 2.0
+        x1 = max(0, min(int(round(cx - half_w)), src_w - crop_w))
+        cropped = frame[0:crop_h, x1:x1 + crop_w]
+        resized = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+        writer.write(resized)
+        idx += 1
 
     cap2.release()
     writer.release()
 
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-loglevel", "error",
+        "-y",
         "-i", str(tmp_silent),
         "-i", str(input_path),
         "-map", "0:v:0",
@@ -411,12 +407,16 @@ def convert_single_clip(
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(f"Errore FFmpeg mux REEL su {input_path.name}: {proc.stderr.strip()}")
+        if tmp_silent.exists():
+            tmp_silent.unlink(missing_ok=True)
+        if tmp_mux.exists():
+            tmp_mux.unlink(missing_ok=True)
+        raise RuntimeError(f"Errore FFmpeg mux REEL su {input_path.name} (rc={proc.returncode}): {proc.stderr.strip()}")
 
     shutil.move(str(tmp_mux), str(output_path))
     if tmp_silent.exists():
         tmp_silent.unlink()
-    logger.info(f"[{SCRIPT_NAME}] Convertita clip REEL: {output_path.name}")
+    logger.info(f"[{SCRIPT_NAME}] Convertita clip REEL: '{output_path.name}'")
 
     return {
         "clip": input_path.name,
@@ -430,7 +430,6 @@ def convert_single_clip(
 
 def main():
     abilita_ansi()
-    pulisci_console()
 
     parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Conversione clip in formato REEL 9:16")
     parser.add_argument("--base-dir", default=".")
@@ -450,30 +449,30 @@ def main():
     imgsz = res["imgsz_default"]
     tipo_slug = sanitize_slug(args.tipo)
 
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}")
-    print(f" {BOLD}{GREEN}INIZIO: {SCRIPT_NAME}{RESET} | Tipo: {BOLD}{args.tipo}{RESET} | Modello: {BOLD}{args.model}{RESET}")
-    print(
-        f" {YELLOW}[CPU/RAM]{RESET} Thread: {res['threads']} | RAM disp.: {res['ram_avail']}/{res['ram_tot']} GB | "
-        f"imgsz auto: {imgsz} | Preset: {res['preset']}"
+    logger.info(
+        f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | model='{args.model}' | "
+        f"imgsz={imgsz} | conf={args.conf} | alpha={args.alpha} | gap_frames={args.gap_frames} | "
+        f"auto={args.auto} | risorse={res}"
     )
-    print(f"{BOLD}{CYAN}{'=' * 80}{RESET}\n")
-    logger.info(f"[{SCRIPT_NAME}] Avvio | tipo={args.tipo} | model={args.model} | imgsz={imgsz} | conf={args.conf} | risorse={res}")
 
     if shutil.which("ffmpeg") is None:
-        print(f"{RED}[X] FFmpeg non trovato nel PATH.{RESET}")
+        print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg non trovato nel PATH.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] FFmpeg non trovato nel PATH.")
         sys.exit(1)
 
     clips = trova_clip_sorgente(dirs["out"], tipo_slug)
     if not clips:
-        print(f"{YELLOW}[!] Nessuna clip sorgente per '{tipo_slug}' trovata in 'OUT/'.{RESET}")
-        logger.warning(f"[{SCRIPT_NAME}] Nessuna clip sorgente in OUT.")
+        print(f"{RED}[X] [{SCRIPT_NAME}] Nessuna clip sorgente per '{tipo_slug}' trovata in 'OUT/'.{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] Nessuna clip sorgente per '{tipo_slug}' trovata in '{dirs['out']}'.")
         sys.exit(1)
+
+    logger.info(f"[{SCRIPT_NAME}] Trovate {len(clips)} clip sorgente: {[c.name for c in clips]}")
 
     try:
         model, model_path = resolve_model(args.model, dirs["model"], base_dir, logger)
     except Exception as e:
-        print(f"{RED}[X] Impossibile preparare/caricare il modello '{args.model}' in 'EXTRA/MODEL/': {e}{RESET}")
-        logger.exception(f"[{SCRIPT_NAME}] Errore modello: {e}")
+        print(f"{RED}[X] [{SCRIPT_NAME}] Impossibile preparare/caricare il modello '{args.model}' in 'EXTRA/MODEL/': {e}{RESET}", file=sys.stderr)
+        logger.exception(f"[{SCRIPT_NAME}] Errore modello '{args.model}': {e}")
         sys.exit(1)
 
     ball_cls_id, ball_cls_name = detect_ball_cls(model, logger)
@@ -483,15 +482,22 @@ def main():
     tot_conf_sum = 0.0
     global_max_conf = 0.0
 
-    with tqdm(clips, desc="Conversione REEL", unit="clip", colour="magenta", ncols=90) as bar:
+    with tqdm(
+        clips,
+        desc="05 | Conversione REEL",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}{postfix}",
+        colour="magenta",
+        ncols=82,
+    ) as bar:
         for clip in bar:
-            bar.set_postfix_str(clip.name)
+            label = short_clip_name(clip, tipo_slug)
+            bar.postfix = f" - {label}"
+            bar.refresh()
             out_reel = dirs["out"] / build_reel_clip_name(clip, tipo_slug)
             if out_reel.is_file() and out_reel.stat().st_size > 0 and out_reel.resolve() != clip.resolve():
                 if args.auto:
                     logger.info(f"[{SCRIPT_NAME}][YOLO-STATS] clip='{clip.name}' | stato=SKIP_EXISTING ('{out_reel.name}')")
                     ok_cnt += 1
-                    bar.set_postfix({"file": clip.name, "ok": ok_cnt, "err": err_cnt})
                     continue
             try:
                 st = convert_single_clip(
@@ -518,9 +524,8 @@ def main():
                 ok_cnt += 1
             except Exception as e:
                 err_cnt += 1
-                logger.exception(f"[{SCRIPT_NAME}] Errore su {clip.name}: {e}")
-                print(f"\n{RED}[X] Errore su {clip.name}: {e}{RESET}")
-            bar.set_postfix({"file": clip.name, "ok": ok_cnt, "err": err_cnt})
+                logger.exception(f"[{SCRIPT_NAME}] Errore su '{clip.name}': {e}")
+                print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore su '{clip.name}': {e} (log: {log_file.name}){RESET}", file=sys.stderr)
 
     overall_ratio = (tot_matches / tot_frames * 100.0) if tot_frames > 0 else 0.0
     overall_avg_conf = (tot_conf_sum / tot_matches) if tot_matches > 0 else 0.0
@@ -530,10 +535,8 @@ def main():
         f"clips_err={err_cnt} | total_frames={tot_frames} | total_matches={tot_matches} "
         f"({overall_ratio:.1f}%) | total_boxes={tot_boxes} | avg_conf={overall_avg_conf:.3f} | max_conf={global_max_conf:.3f}"
     )
-
-    print(f"\n{GREEN}[✔] Conversione REEL completata! Clip pronte: {ok_cnt}/{len(clips)} (errori: {err_cnt}){RESET}")
-    print(f"    Log salvato: '{log_file}'")
     logger.info(f"[{SCRIPT_NAME}] Completato: ok={ok_cnt}, err={err_cnt}")
+
     if ok_cnt == 0:
         sys.exit(1)
 
