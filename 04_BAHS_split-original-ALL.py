@@ -311,6 +311,9 @@ def esegui_taglio_parallelo(
     errors_list: list[str] = []
     bar_lock = threading.Lock()
 
+    sys.stdout.flush()
+    sys.stderr.flush()
+
     with ThreadPoolExecutor(max_workers=res["max_workers"]) as pool:
         futures = {}
         for idx, ts in enumerate(basket_times, start=1):
@@ -329,7 +332,14 @@ def esegui_taglio_parallelo(
             )
             futures[fut] = out_clip.name
 
-        with tqdm(total=len(basket_times), desc="04 | Taglio Clip", unit="clip", colour="blue", ncols=78) as bar:
+        with tqdm(
+            total=len(basket_times),
+            desc="04 | Taglio Clip",
+            unit="clip",
+            colour="blue",
+            ncols=78,
+            file=sys.stdout,
+        ) as bar:
             for fut in as_completed(futures):
                 ok, err_msg = fut.result()
                 with bar_lock:
@@ -341,6 +351,7 @@ def esegui_taglio_parallelo(
                     bar.set_postfix({"ok": ok_cnt, "err": err_cnt})
                     bar.update(1)
 
+    sys.stdout.flush()
     return ok_cnt, err_cnt, errors_list
 
 
@@ -373,7 +384,7 @@ def main():
     )
 
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.{RESET}", file=sys.stderr)
+        print(f"\n{RED}[X] [{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.{RESET}", file=sys.stderr, flush=True)
         logger.error(f"[{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.")
         sys.exit(1)
 
@@ -383,7 +394,7 @@ def main():
         if args.auto:
             logger.info(f"[{SCRIPT_NAME}] Modalità AUTO: clip esistenti mantenute, step saltato.")
             return
-        print(f"\n{YELLOW}[!] ATTENZIONE: Trovate {len(existing_clips)} clip già presenti in 'OUT/'.{RESET}")
+        print(f"\n{YELLOW}[!] ATTENZIONE: Trovate {len(existing_clips)} clip già presenti in 'OUT/'.{RESET}", flush=True)
         print("   1. Sovrascrivi e rigenera tutte le clip")
         print("   2. Salta (mantieni clip esistenti)")
         print("   3. Interrompi script")
@@ -398,10 +409,10 @@ def main():
                     old_clip.unlink(missing_ok=True)
                 break
             if sc == "3":
-                print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
+                print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}", flush=True)
                 logger.info(f"[{SCRIPT_NAME}] Interrotto dall'utente.")
                 return
-            print(f"{RED}[!] Scelta non valida.{RESET}")
+            print(f"{RED}[!] Scelta non valida.{RESET}", flush=True)
 
     default_v = risolvi_video_sorgente(dirs["out"], tipo_slug, fmt_slug)
     if args.auto:
@@ -412,13 +423,13 @@ def main():
         video_path = risolvi_video_sorgente(dirs["out"], tipo_slug, fmt_slug, raw_v or None)
 
     if not video_path or not video_path.is_file():
-        print(f"{RED}[X] [{SCRIPT_NAME}] Video sorgente non trovato in 'OUT/'.{RESET}", file=sys.stderr)
+        print(f"\n{RED}[X] [{SCRIPT_NAME}] Video sorgente non trovato in 'OUT/'.{RESET}", file=sys.stderr, flush=True)
         logger.error(f"[{SCRIPT_NAME}] Video sorgente non trovato in '{dirs['out']}'.")
         sys.exit(1)
 
     basket_times, ts_source_path = load_timestamps(dirs["out"], tipo_slug, fmt_slug)
     if not basket_times:
-        print(f"{RED}[X] [{SCRIPT_NAME}] Nessun timestamp valido trovato in 'OUT/' ({tipo_slug}_{fmt_slug}_timestamps.txt o timestamps.txt).{RESET}", file=sys.stderr)
+        print(f"\n{RED}[X] [{SCRIPT_NAME}] Nessun timestamp valido trovato in 'OUT/' ({tipo_slug}_{fmt_slug}_timestamps.txt o timestamps.txt).{RESET}", file=sys.stderr, flush=True)
         logger.error(f"[{SCRIPT_NAME}] Timestamp mancanti o non validi in '{dirs['out']}'.")
         sys.exit(1)
 
@@ -431,7 +442,7 @@ def main():
         basket_times = valid_times
 
     if not basket_times:
-        print(f"{RED}[X] [{SCRIPT_NAME}] Nessun timestamp valido rispetto alla durata del video.{RESET}", file=sys.stderr)
+        print(f"\n{RED}[X] [{SCRIPT_NAME}] Nessun timestamp valido rispetto alla durata del video.{RESET}", file=sys.stderr, flush=True)
         logger.error(f"[{SCRIPT_NAME}] Nessun timestamp valido rispetto alla durata video ({vid_dur}).")
         sys.exit(1)
 
@@ -461,9 +472,9 @@ def main():
     logger.info(f"[{SCRIPT_NAME}] Completato: ok={ok_cnt}/{len(basket_times)}, err={err_cnt}")
 
     if err_cnt > 0:
-        print(f"\n{RED}[X] [{SCRIPT_NAME}] Errori durante il taglio di {err_cnt}/{len(basket_times)} clip (log: {log_file.name}):{RESET}", file=sys.stderr)
+        print(f"\n{RED}[X] [{SCRIPT_NAME}] Errori durante il taglio di {err_cnt}/{len(basket_times)} clip (log: {log_file.name}):{RESET}", file=sys.stderr, flush=True)
         for e in errors_list[:5]:
-            print(f"{RED}   • {e}{RESET}", file=sys.stderr)
+            print(f"{RED}   • {e}{RESET}", file=sys.stderr, flush=True)
 
     if ok_cnt == 0:
         sys.exit(1)
