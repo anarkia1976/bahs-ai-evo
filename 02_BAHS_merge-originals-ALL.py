@@ -77,15 +77,11 @@ def calcola_risorse() -> dict:
     threads = os.cpu_count() or 4
     cores = max(2, threads // 2)
     ram_tot, ram_avail = rileva_ram_gb()
-    max_workers = 2 if (threads <= 4 or ram_avail < 6.0) else min(cores, 8)
-    threads_per_worker = max(1, min(4, threads // max_workers))
     return {
         "threads": threads,
         "cores": cores,
         "ram_tot": ram_tot,
         "ram_avail": ram_avail,
-        "max_workers": max_workers,
-        "threads_per_worker": threads_per_worker,
     }
 
 
@@ -154,7 +150,7 @@ def gestione_file_esistente(out_file: Path, auto: bool, logger: logging.Logger) 
 def main():
     abilita_ansi()
 
-    parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Unione video originali da IN a OUT")
+    parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Preparazione o unione video originali da IN a OUT")
     parser.add_argument("--base-dir", default=".")
     parser.add_argument("--tipo", default="HIGHLIGHTS")
     parser.add_argument("--sottotitolo", default="CAMPIONATO - TEAM vs TEAM")
@@ -171,19 +167,16 @@ def main():
     if fmt_slug not in ("1080P", "REEL"):
         fmt_slug = "1080P"
 
+    pid = os.getpid()
     out_file = dirs["out"] / f"{tipo_slug}_{fmt_slug}_merged_orig.mp4"
     legacy_named = dirs["out"] / f"merged_orig_{tipo_slug}_{fmt_slug}.mp4"
-    list_file = dirs["tmp"] / f"concat_orig_{tipo_slug}_{fmt_slug}.txt"
+    tmp_out_file = dirs["tmp"] / f"{out_file.stem}_{pid}.part.mp4"
+    list_file = dirs["tmp"] / f"concat_orig_{tipo_slug}_{fmt_slug}_{pid}.txt"
 
     logger.info(
         f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | formato='{fmt_slug}' | "
         f"auto={args.auto} | out_file='{out_file}' | risorse={res}"
     )
-
-    if shutil.which("ffmpeg") is None:
-        print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg non trovato nel PATH.{RESET}", file=sys.stderr)
-        logger.error(f"[{SCRIPT_NAME}] FFmpeg non trovato nel PATH.")
-        sys.exit(1)
 
     target_check = out_file if out_file.is_file() else (legacy_named if legacy_named.is_file() else out_file)
     azione = gestione_file_esistente(target_check, args.auto, logger)
@@ -206,44 +199,93 @@ def main():
     logger.info(f"[{SCRIPT_NAME}] Trovati {len(videos)} video originali in IN: {[v.name for v in videos]}")
 
     try:
-        with open(list_file, "w", encoding="utf-8") as f:
-            for v in videos:
-                f.write(f"file '{v.resolve().as_posix()}'\n")
-        logger.info(f"[{SCRIPT_NAME}] Generata lista concat in '{list_file}' ({len(videos)} file).")
+        if len(videos) == 1:
+            single_vid = videos[0]
+            if single_vid.suffix.lower() == ".mp4":
+                logger.info(f"[{SCRIPT_NAME}] Singolo video MP4 rilevato: copia diretta '{single_vid.name}' -> '{out_file.name}'.")
+                with tqdm(total=100, desc="02 | Copia Originale", unit="%", colour="green", ncols=78) as bar:
+                    shutil.copy2(single_vid, tmp_out_file)
+                    bar.update(100)
+            else:
+                if shutil.which("ffmpeg") is None:
+                    print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg non trovato nel PATH.{RESET}", file=sys.stderr)
+                    logger.error(f"[{SCRIPT_NAME}] FFmpeg non trovato nel PATH.")
+                    sys.exit(1)
+                cmd = [
+                    "ffmpeg",
+                    "-loglevel", "error",
+                    "-y",
+                    "-i", str(single_vid),
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    str(tmp_out_file),
+                ]
+                logger.info(f"[{SCRIPT_NAME}] Singolo video non-MP4: remux diretto '{single_vid.name}' -> cmd={cmd}")
+                with tqdm(total=100, desc="02 | Remux Originale", unit="%", colour="green", ncols=78) as bar:
+                    bar.update(25)
+                    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    bar.update(75)
+                if proc.returncode != 0 or not tmp_out_file.is_file() or tmp_out_file.stat().st_size == 0:
+                    err_msg = proc.stderr.strip() or f"returncode={proc.returncode}"
+                    print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore durante il remux con FFmpeg (log: {log_file.name}).{RESET}", file=sys.stderr)
+                    logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg remux (rc={proc.returncode}): {err_msg}")
+                    sys.exit(1)
+        else:
+            if shutil.which("ffmpeg") is None:
+                print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg non trovato nel PATH.{RESET}", file=sys.stderr)
+                logger.error(f"[{SCRIPT_NAME}] FFmpeg non trovato nel PATH.")
+                sys.exit(1)
 
-        cmd = [
-            "ffmpeg",
-            "-loglevel", "error",
-            "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(list_file),
-            "-threads", str(res["threads"]),
-            "-c", "copy",
-            str(out_file),
-        ]
-        logger.info(f"[{SCRIPT_NAME}] Esecuzione comando FFmpeg: {cmd}")
+            with open(list_file, "w", encoding="utf-8") as f:
+                for v in videos:
+                    f.write(f"file '{v.resolve().as_posix()}'\n")
+            logger.info(f"[{SCRIPT_NAME}] Generata lista concat in '{list_file}' ({len(videos)} file).")
 
-        with tqdm(total=100, desc="02 | Unione Originali", unit="%", colour="green", ncols=78) as bar:
-            bar.update(20)
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            bar.update(80)
+            cmd = [
+                "ffmpeg",
+                "-loglevel", "error",
+                "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(list_file),
+                "-c", "copy",
+                "-movflags", "+faststart",
+                str(tmp_out_file),
+            ]
+            logger.info(f"[{SCRIPT_NAME}] Esecuzione comando FFmpeg: {cmd}")
 
-        if proc.returncode != 0 or not out_file.is_file() or out_file.stat().st_size == 0:
-            err_msg = proc.stderr.strip() or f"returncode={proc.returncode}"
-            print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore durante l'unione con FFmpeg (log: {log_file.name}).{RESET}", file=sys.stderr)
-            logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg (rc={proc.returncode}): {err_msg}")
-            sys.exit(1)
+            with tqdm(total=100, desc="02 | Unione Originali", unit="%", colour="green", ncols=78) as bar:
+                bar.update(20)
+                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                bar.update(80)
 
+            if proc.returncode != 0 or not tmp_out_file.is_file() or tmp_out_file.stat().st_size == 0:
+                err_msg = proc.stderr.strip() or f"returncode={proc.returncode}"
+                print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore durante l'unione con FFmpeg (log: {log_file.name}).{RESET}", file=sys.stderr)
+                logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg concat (rc={proc.returncode}): {err_msg}")
+                sys.exit(1)
+
+        if not tmp_out_file.is_file() or tmp_out_file.stat().st_size == 0:
+            raise RuntimeError(f"File temporaneo non valido: '{tmp_out_file}'")
+
+        os.replace(tmp_out_file, out_file)
         size_mb = out_file.stat().st_size / (1024 * 1024)
         logger.info(f"[{SCRIPT_NAME}] Completato con successo: '{out_file}' ({size_mb:.2f} MB)")
 
+    except Exception as e:
+        if not isinstance(e, SystemExit):
+            print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore durante la preparazione del video in OUT (log: {log_file.name}).{RESET}", file=sys.stderr)
+            logger.exception(f"[{SCRIPT_NAME}] Errore imprevisto: {e}")
+            sys.exit(1)
+        raise
+
     finally:
-        if list_file.exists():
-            try:
-                list_file.unlink()
-            except Exception as e:
-                logger.warning(f"[{SCRIPT_NAME}] Impossibile rimuovere file temporaneo '{list_file}': {e}")
+        for temp_p in (list_file, tmp_out_file):
+            if temp_p.exists():
+                try:
+                    temp_p.unlink()
+                except Exception as e:
+                    logger.warning(f"[{SCRIPT_NAME}] Impossibile rimuovere file temporaneo '{temp_p}': {e}")
 
 
 if __name__ == "__main__":
