@@ -3,23 +3,41 @@ import sys
 import stat
 import time
 import shutil
-import ctypes
 import logging
 import importlib
 import subprocess
 from importlib import metadata
-from datetime import datetime
 from pathlib import Path
+
+from bahs_core import (
+    BLUE,
+    BOLD,
+    CYAN,
+    DIM,
+    GREEN,
+    MAGENTA,
+    NO_MUSIC_TYPES,
+    RED,
+    REQUIRED_DIRS,
+    RESET,
+    VIDEO_EXTS,
+    YELLOW,
+    clear_console,
+    compute_system_resources,
+    enable_ansi_console,
+    ensure_project_dirs,
+    has_valid_timestamps,
+    normalize_format,
+    sanitize_slug,
+    setup_step_logger,
+)
 
 SCRIPT_NAME = "01_BAHS_main-ALL"
 BAR_WIDTH = 82
 DIVIDER = "=" * BAR_WIDTH
 
-REQUIRED_DIRS = ["IN", "OUT", "FINAL", "TMP", "LOG", "MUSIC", "EXTRA"]
 PROTECTED_CLEAN_DIRS = {"IN", "EXTRA", "MUSIC"}
 WORK_CLEAN_DIRS = ["OUT", "FINAL", "TMP"]
-VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm")
-NO_MUSIC_TYPES = {"GAMEDAY", "FRIENDLY MATCH"}
 
 PACKAGE_TO_IMPORT = {
     "opencv-python": "cv2",
@@ -32,129 +50,8 @@ PACKAGE_TO_IMPORT = {
 }
 CORE_IMPORTS = [("opencv-python", "cv2"), ("tqdm", "tqdm")]
 
-RESET = "\033[0m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-CYAN = "\033[96m"
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-BLUE = "\033[94m"
-MAGENTA = "\033[95m"
 
-
-def abilita_ansi():
-    if os.name == "nt":
-        try:
-            kernel32 = ctypes.windll.kernel32
-            h = kernel32.GetStdHandle(-11)
-            mode = ctypes.c_uint32()
-            if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
-                kernel32.SetConsoleMode(h, mode.value | 0x0004)
-        except Exception:
-            os.system("")
-
-
-def pulisci_console():
-    os.system("cls" if os.name == "nt" else "clear")
-
-
-def rileva_ram_gb() -> tuple[float, float]:
-    try:
-        import psutil  # type: ignore
-        vm = psutil.virtual_memory()
-        return round(vm.total / (1024 ** 3), 1), round(vm.available / (1024 ** 3), 1)
-    except Exception:
-        pass
-
-    if os.name == "nt":
-        try:
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-            stat_mem = MEMORYSTATUSEX()
-            stat_mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat_mem))
-            return round(stat_mem.ullTotalPhys / (1024 ** 3), 1), round(stat_mem.ullAvailPhys / (1024 ** 3), 1)
-        except Exception:
-            return 8.0, 4.0
-
-    meminfo_path = Path("/proc/meminfo")
-    if meminfo_path.is_file():
-        total_kb = 0
-        avail_kb = 0
-        for line in meminfo_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.startswith("MemTotal:"):
-                total_kb = int(line.split()[1])
-            elif line.startswith("MemAvailable:"):
-                avail_kb = int(line.split()[1])
-        if total_kb > 0:
-            return round(total_kb / (1024 ** 2), 1), round((avail_kb or total_kb // 2) / (1024 ** 2), 1)
-
-    return 8.0, 4.0
-
-
-def calcola_risorse_sistema() -> dict:
-    threads = os.cpu_count() or 4
-    cores = max(2, threads // 2)
-    ram_tot, ram_avail = rileva_ram_gb()
-
-    if threads <= 4 or ram_avail < 6.0:
-        max_workers = 2
-        threads_per_worker = max(1, threads // 2)
-        preset = "veryfast"
-    elif threads <= 8 or ram_avail < 12.0:
-        max_workers = min(4, cores)
-        threads_per_worker = 2
-        preset = "fast"
-    else:
-        max_workers = min(cores, 8)
-        threads_per_worker = min(4, max(2, threads // max_workers))
-        preset = "fast"
-
-    return {
-        "threads": threads,
-        "cores": cores,
-        "ram_tot": ram_tot,
-        "ram_avail": ram_avail,
-        "max_workers": max_workers,
-        "threads_per_worker": threads_per_worker,
-        "preset": preset,
-    }
-
-
-def sanitize_slug(text: str) -> str:
-    cleaned = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in text.strip())
-    while "__" in cleaned:
-        cleaned = cleaned.replace("__", "_")
-    return cleaned.strip("_") or "INCONTRO"
-
-
-def setup_logger(log_dir: Path) -> tuple[logging.Logger, Path]:
-    log_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"{SCRIPT_NAME}_{ts}.log"
-
-    logger = logging.getLogger(SCRIPT_NAME)
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    logger.addHandler(fh)
-    return logger, log_file
-
-
-def stampa_banner(res: dict):
+def stampa_banner(res: dict) -> None:
     print(f"{BOLD}{CYAN}{DIVIDER}{RESET}")
     print(f" {BOLD}{GREEN}BAHS - BASKETBALL AUTOMATION HIGHLIGHTS SUITE (MAIN ORCHESTRATOR){RESET}")
     print(f" {YELLOW}[Caratteristiche Sistema]{RESET}")
@@ -167,16 +64,14 @@ def stampa_banner(res: dict):
     print(f"{BOLD}{CYAN}{DIVIDER}{RESET}\n")
 
 
-def verifica_e_crea_cartelle(base_dir: Path, logger: logging.Logger):
+def verifica_e_crea_cartelle(base_dir: Path, logger: logging.Logger) -> None:
     print(f"{BOLD}{CYAN}[1/4] Verifica e creazione cartelle di lavoro...{RESET}")
-    created_cnt = 0
+    existed_before = {d: (base_dir / d).exists() for d in REQUIRED_DIRS}
+    dirs = ensure_project_dirs(base_dir)
+    created_cnt = sum(1 for d in REQUIRED_DIRS if not existed_before[d])
     for d in REQUIRED_DIRS:
-        p = base_dir / d
-        existed = p.exists()
-        p.mkdir(parents=True, exist_ok=True)
-        if not existed:
-            created_cnt += 1
-        logger.info(f"[{SCRIPT_NAME}] Cartella '{d}': {'esistente' if existed else 'creata'} ({p})")
+        stato = "esistente" if existed_before[d] else "creata"
+        logger.info(f"[{SCRIPT_NAME}] Cartella '{d}': {stato} ({dirs[d.lower()]})")
     print(f"   {GREEN}[✔] Cartelle verificate ({len(REQUIRED_DIRS)} totali, {created_cnt} create).{RESET}")
     print(f"{DIM}   Cartelle protette dalla pulizia: {', '.join(sorted(PROTECTED_CLEAN_DIRS))}{RESET}\n")
 
@@ -299,7 +194,7 @@ def verifica_ffmpeg_e_requirements(base_dir: Path, logger: logging.Logger) -> bo
             print(f"   {RED}[!] Scelta non valida. Inserisci 1 oppure 0.{RESET}")
 
 
-def _rimuovi_elemento_forzato(percorso: Path):
+def _rimuovi_elemento_forzato(percorso: Path) -> None:
     def _handle_remove_readonly(func, path, exc_info):
         try:
             os.chmod(path, stat.S_IWRITE)
@@ -317,7 +212,7 @@ def _rimuovi_elemento_forzato(percorso: Path):
         shutil.rmtree(percorso, onerror=_handle_remove_readonly)
 
 
-def chiedi_pulizia_cartelle(base_dir: Path, log_file_attuale: Path, logger: logging.Logger):
+def chiedi_pulizia_cartelle(base_dir: Path, log_file_attuale: Path, logger: logging.Logger) -> None:
     print(f"{BOLD}{CYAN}[3/4] Pulizia cartelle di lavoro (IN, EXTRA e MUSIC sono SEMPRE protette)...{RESET}")
     print(f"   1. Ripulire ({', '.join(WORK_CLEAN_DIRS)} e vecchi log in 'LOG/')")
     print(f"   2. Non ripulire {DIM}[Default]{RESET}")
@@ -442,22 +337,9 @@ def chiedi_parametri_incontro() -> tuple[str, str, str]:
     return tipo_incontro, riga_seconda, formato
 
 
-def ha_timestamp_validi(txt_path: Path) -> bool:
-    if not txt_path.is_file() or txt_path.stat().st_size == 0:
-        return False
-    for line in txt_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        for part in s.split(","):
-            if part.strip():
-                return True
-    return False
-
-
 def costruisci_pipeline(base_dir: Path, tipo_incontro: str, formato: str, logger: logging.Logger | None = None) -> list[dict]:
     tipo_upper = tipo_incontro.strip().upper()
-    fmt_upper = formato.strip().upper()
+    fmt_upper = normalize_format(formato)
 
     if tipo_upper != "HIGHLIGHTS":
         steps = [
@@ -473,7 +355,7 @@ def costruisci_pipeline(base_dir: Path, tipo_incontro: str, formato: str, logger
         return steps
 
     timestamps_file = base_dir / "OUT" / "timestamps.txt"
-    skip_timestamps = ha_timestamp_validi(timestamps_file)
+    skip_timestamps = has_valid_timestamps(timestamps_file)
     if skip_timestamps and logger:
         logger.info(f"[{SCRIPT_NAME}] Trovato '{timestamps_file}' valido per HIGHLIGHTS ({fmt_upper}): step 03_BAHS_identify-timestamps-ALL.py saltato.")
 
@@ -512,7 +394,7 @@ def costruisci_pipeline(base_dir: Path, tipo_incontro: str, formato: str, logger
 
 def trova_output_logo_finale(base_dir: Path, tipo_incontro: str, formato: str) -> Path | None:
     tipo_slug = sanitize_slug(tipo_incontro)
-    fmt_slug = formato.strip().upper()
+    fmt_slug = normalize_format(formato)
     final_dir = base_dir / "FINAL"
     if not final_dir.is_dir():
         return None
@@ -524,7 +406,7 @@ def trova_output_logo_finale(base_dir: Path, tipo_incontro: str, formato: str) -
     return matches[0] if matches else None
 
 
-def stampa_intestazione_step(step_num: int, total_steps: int, step_info: dict):
+def stampa_intestazione_step(step_num: int, total_steps: int, step_info: dict) -> None:
     banner = (
         f"\n{CYAN}{DIVIDER}\n"
         f"{BOLD}▶ [STEP {step_num}/{total_steps} IN ESECUZIONE]{RESET}{CYAN} {step_info['label']}\n"
@@ -534,7 +416,15 @@ def stampa_intestazione_step(step_num: int, total_steps: int, step_info: dict):
     print(banner, flush=True)
 
 
-def esegui_script_diretto(base_dir: Path, script_name: str, tipo_incontro: str, riga_seconda: str, formato: str, interactive: bool, logger: logging.Logger) -> tuple[bool, float]:
+def esegui_script_diretto(
+    base_dir: Path,
+    script_name: str,
+    tipo_incontro: str,
+    riga_seconda: str,
+    formato: str,
+    interactive: bool,
+    logger: logging.Logger,
+) -> tuple[bool, float]:
     script_path = base_dir / script_name
     if not script_path.is_file():
         print(f"   {RED}[X] Modulo mancante: {script_path.name}{RESET}", flush=True)
@@ -564,7 +454,16 @@ def esegui_script_diretto(base_dir: Path, script_name: str, tipo_incontro: str, 
     return False, elapsed_step
 
 
-def esegui_step(base_dir: Path, step_info: dict, step_num: int, total_steps: int, tipo_incontro: str, riga_seconda: str, formato: str, logger: logging.Logger) -> tuple[bool, float]:
+def esegui_step(
+    base_dir: Path,
+    step_info: dict,
+    step_num: int,
+    total_steps: int,
+    tipo_incontro: str,
+    riga_seconda: str,
+    formato: str,
+    logger: logging.Logger,
+) -> tuple[bool, float]:
     script_name = step_info["script"]
     stampa_intestazione_step(step_num, total_steps, step_info)
     ok, elapsed = esegui_script_diretto(
@@ -617,13 +516,14 @@ def esegui_step(base_dir: Path, step_info: dict, step_num: int, total_steps: int
     return ok, elapsed
 
 
-def main():
-    abilita_ansi()
-    pulisci_console()
+def main() -> None:
+    enable_ansi_console()
+    clear_console()
 
     base_dir = Path(__file__).resolve().parent
-    res = calcola_risorse_sistema()
-    logger, log_file = setup_logger(base_dir / "LOG")
+    res = compute_system_resources()
+    dirs = ensure_project_dirs(base_dir)
+    logger, log_file = setup_step_logger(dirs["log"], SCRIPT_NAME)
     logger.info(f"[{SCRIPT_NAME}] Avvio orchestratore | base_dir='{base_dir}' | risorse={res}")
 
     stampa_banner(res)
@@ -643,7 +543,7 @@ def main():
     print(f"  Tipo incontro : {BOLD}{tipo_incontro}{RESET}")
     print(f"  Seconda riga  : {BOLD}{riga_seconda}{RESET}")
     print(f"  Formato target: {BOLD}{formato}{RESET}")
-    if tipo_incontro.strip().upper() == "HIGHLIGHTS" and ha_timestamp_validi(base_dir / "OUT" / "timestamps.txt"):
+    if tipo_incontro.strip().upper() == "HIGHLIGHTS" and has_valid_timestamps(base_dir / "OUT" / "timestamps.txt"):
         print(f"  Timestamp {formato}: {GREEN}rilevato 'OUT/timestamps.txt' (step 03 saltato){RESET}")
     print(f"  Step previsti : {total_steps}")
     print(f"{BOLD}{MAGENTA}{DIVIDER}{RESET}\n")
@@ -681,7 +581,7 @@ def main():
 
     elapsed = time.perf_counter() - t_start
     final_logo_file = trova_output_logo_finale(base_dir, tipo_incontro, formato)
-    default_final_name = f"{sanitize_slug(tipo_incontro)}_{formato.strip().upper()}_with_fade_music_text_logo.mp4"
+    default_final_name = f"{sanitize_slug(tipo_incontro)}_{normalize_format(formato)}_with_fade_music_text_logo.mp4"
     video_finale_nome = final_logo_file.name if final_logo_file else default_final_name
 
     print(f"\n{BOLD}{GREEN}{DIVIDER}{RESET}")

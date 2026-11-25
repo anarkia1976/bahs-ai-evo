@@ -2,7 +2,6 @@ import os
 import re
 import sys
 import math
-import ctypes
 import shutil
 import logging
 import argparse
@@ -10,274 +9,34 @@ import warnings
 import threading
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 from pathlib import Path
 import cv2
 import torch
 from tqdm import tqdm
 from ultralytics import YOLO
 
+from bahs_core import (
+    MODEL_EXTS,
+    RED,
+    YELLOW,
+    RESET,
+    build_reel_clip_name,
+    check_ffmpeg_tools,
+    compute_system_resources,
+    detect_gpu_and_encoder,
+    enable_ansi_console,
+    ensure_project_dirs,
+    normalize_format,
+    sanitize_slug,
+    setup_step_logger,
+)
+
 SCRIPT_NAME = "05_BAHS_convert-clips-REEL"
 COCO_SPORTS_BALL_CLASS = 32
 BALL_KEYWORDS = ("sports ball", "basketball", "ball")
-MODEL_EXTS = {".pt", ".onnx", ".engine", ".tflite", ".pb"}
 UNIFORM_CLIP_RE = re.compile(r"^.+_(?:1080P|REEL)_clip_\d{2}_(?:\d{1,2}-)?\d{1,2}-\d{2}\.mp4$", re.IGNORECASE)
 LEGACY_CLIP_RE = re.compile(r"^canestro_\d{2}_(?:\d{1,2}-)?\d{1,2}-\d{2}(?:_[A-Za-z0-9_-]+)?\.mp4$", re.IGNORECASE)
 TIMESTAMP_SUFFIX_RE = re.compile(r"_(?:\d{1,2}-)?\d{1,2}-\d{2}(?:_[A-Za-z0-9_-]+)?$", re.IGNORECASE)
-
-RESET = "\033[0m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-CYAN = "\033[96m"
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-
-
-def abilita_ansi():
-    if os.name == "nt":
-        try:
-            k = ctypes.windll.kernel32
-            h = k.GetStdHandle(-11)
-            m = ctypes.c_uint32()
-            if k.GetConsoleMode(h, ctypes.byref(m)):
-                k.SetConsoleMode(h, m.value | 0x0004)
-        except Exception:
-            os.system("")
-
-
-def rileva_ram_gb() -> tuple[float, float]:
-    try:
-        import psutil  # type: ignore
-        vm = psutil.virtual_memory()
-        return round(vm.total / (1024 ** 3), 1), round(vm.available / (1024 ** 3), 1)
-    except Exception:
-        pass
-    if os.name == "nt":
-        try:
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-            st = MEMORYSTATUSEX()
-            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
-            return round(st.ullTotalPhys / (1024 ** 3), 1), round(st.ullAvailPhys / (1024 ** 3), 1)
-        except Exception:
-            return 8.0, 4.0
-    p = Path("/proc/meminfo")
-    if p.is_file():
-        tot = avail = 0
-        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.startswith("MemTotal:"):
-                tot = int(line.split()[1])
-            elif line.startswith("MemAvailable:"):
-                avail = int(line.split()[1])
-        if tot > 0:
-            return round(tot / (1024 ** 2), 1), round((avail or tot // 2) / (1024 ** 2), 1)
-    return 8.0, 4.0
-
-
-def calcola_risorse() -> dict:
-    threads = os.cpu_count() or 4
-    cores = max(2, threads // 2)
-    ram_tot, ram_avail = rileva_ram_gb()
-
-    if threads <= 4 or ram_avail < 6.0:
-        imgsz_default = 640
-        preset = "veryfast"
-    elif ram_avail < 12.0:
-        imgsz_default = 960
-        preset = "fast"
-    else:
-        imgsz_default = None
-        preset = "fast"
-
-    return {
-        "threads": threads,
-        "cores": cores,
-        "ram_tot": ram_tot,
-        "ram_avail": ram_avail,
-        "imgsz_default": imgsz_default,
-        "preset": preset,
-    }
-
-
-def _parse_device_token(tok: str, cuda_count: int) -> str | None:
-    t = tok.strip().lower()
-    if not t:
-        return None
-    if t == "cpu":
-        return "cpu"
-    if t.isdigit():
-        idx = int(t)
-        return f"cuda:{idx}" if 0 <= idx < cuda_count else None
-    if t == "cuda":
-        return "cuda:0" if cuda_count > 0 else None
-    if t.startswith("cuda:"):
-        tail = t.split(":", 1)[1].strip()
-        if tail.isdigit():
-            idx = int(tail)
-            return f"cuda:{idx}" if 0 <= idx < cuda_count else None
-        return t if cuda_count > 0 else None
-    return None
-
-
-def rileva_gpu(requested_device: str, logger: logging.Logger) -> dict:
-    req = (requested_device or "auto").strip().lower()
-    cuda_available = False
-    cuda_count = 0
-    devices_detail: list[dict] = []
-
-    try:
-        cuda_available = bool(torch.cuda.is_available())
-        cuda_count = int(torch.cuda.device_count()) if cuda_available else 0
-    except Exception as e:
-        logger.warning(f"[{SCRIPT_NAME}][GPU] Errore verifica CUDA: {e}")
-        cuda_available = False
-        cuda_count = 0
-
-    for idx in range(cuda_count):
-        try:
-            name = torch.cuda.get_device_name(idx)
-        except Exception:
-            name = f"CUDA:{idx}"
-        devices_detail.append({
-            "index": idx,
-            "device": f"cuda:{idx}",
-            "name": name,
-        })
-
-    if devices_detail:
-        desc_gpus = ", ".join(f"cuda:{d['index']} ({d['name']})" for d in devices_detail)
-        logger.info(f"[{SCRIPT_NAME}][GPU] Rilevate {cuda_count} GPU: {desc_gpus}")
-    else:
-        logger.info(f"[{SCRIPT_NAME}][GPU] Nessuna GPU CUDA rilevata.")
-
-    if req == "cpu":
-        selected_devices = ["cpu"]
-    elif req == "auto":
-        selected_devices = [f"cuda:{idx}" for idx in range(cuda_count)] if cuda_count > 0 else ["cpu"]
-    else:
-        tokens = [tok for tok in req.split(",") if tok.strip()]
-        parsed: list[str] = []
-        for tok in tokens:
-            mapped = _parse_device_token(tok, cuda_count)
-            if mapped and mapped not in parsed:
-                parsed.append(mapped)
-        if not parsed:
-            if req != "cpu":
-                logger.warning(
-                    f"[{SCRIPT_NAME}][GPU] Dispositivo '{requested_device}' non valido o non disponibile -> fallback su 'cpu'."
-                )
-            selected_devices = ["cpu"]
-        else:
-            selected_devices = parsed
-
-    ff_encoder = "libx264"
-    ff_hw_mode = "cpu"
-    use_gpu = any(d.startswith("cuda") for d in selected_devices)
-
-    if use_gpu or req == "auto":
-        try:
-            enc_out = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-encoders"],
-                capture_output=True,
-                text=True,
-                check=False,
-            ).stdout or ""
-
-            candidates: list[tuple[str, str]] = []
-            if "h264_nvenc" in enc_out:
-                candidates.append(("h264_nvenc", "nvenc"))
-            if "h264_amf" in enc_out:
-                candidates.append(("h264_amf", "amf"))
-
-            for codec, mode in candidates:
-                test_cmd = [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel", "error",
-                    "-f", "lavfi",
-                    "-i", "color=c=black:s=128x128:r=1:d=0.1",
-                    "-c:v", codec,
-                    "-f", "null",
-                    "-",
-                ]
-                proc = subprocess.run(test_cmd, capture_output=True, text=True, check=False)
-                if proc.returncode == 0:
-                    ff_encoder = codec
-                    ff_hw_mode = mode
-                    break
-        except Exception as e:
-            logger.warning(f"[{SCRIPT_NAME}][GPU] Verifica encoder hardware FFmpeg fallita, uso libx264: {e}")
-            ff_encoder = "libx264"
-            ff_hw_mode = "cpu"
-
-    info = {
-        "cuda_available": cuda_available,
-        "cuda_count": cuda_count,
-        "devices_detail": devices_detail,
-        "yolo_devices": selected_devices,
-        "primary_device": selected_devices[0],
-        "ff_encoder": ff_encoder,
-        "ff_hw_mode": ff_hw_mode,
-    }
-    logger.info(
-        f"[{SCRIPT_NAME}][GPU] req='{requested_device}' | count={cuda_count} | "
-        f"devices={selected_devices} | ff_encoder='{ff_encoder}'"
-    )
-    return info
-
-
-def sanitize_slug(text: str) -> str:
-    cleaned = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in text.strip())
-    while "__" in cleaned:
-        cleaned = cleaned.replace("__", "_")
-    return cleaned.strip("_") or "INCONTRO"
-
-
-def setup_dirs_and_logger(base_dir: Path) -> tuple[dict[str, Path], logging.Logger, Path]:
-    extra_dir = base_dir / "EXTRA"
-    dirs = {
-        "in": base_dir / "IN",
-        "out": base_dir / "OUT",
-        "final": base_dir / "FINAL",
-        "tmp": base_dir / "TMP",
-        "log": base_dir / "LOG",
-        "music": base_dir / "MUSIC",
-        "extra": extra_dir,
-        "model": extra_dir / "MODEL",
-    }
-    for p in dirs.values():
-        p.mkdir(parents=True, exist_ok=True)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = dirs["log"] / f"{SCRIPT_NAME}_{ts}.log"
-
-    logger = logging.getLogger(SCRIPT_NAME)
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    logger.addHandler(fh)
-    return dirs, logger, log_file
-
-
-def build_reel_clip_name(clip_path: Path, tipo_slug: str) -> str:
-    m = re.match(r"^.+_(?:1080P|REEL)_(clip_\d{2}_.+)$", clip_path.stem, re.IGNORECASE)
-    if m:
-        return f"{tipo_slug}_REEL_{m.group(1)}.mp4"
-    return f"{tipo_slug}_REEL_{clip_path.stem}.mp4"
 
 
 def short_clip_name(clip_path: Path, tipo_slug: str) -> str:
@@ -306,7 +65,7 @@ def trova_clip_sorgente(out_dir: Path, tipo_slug: str) -> list[Path]:
     ])
 
 
-def log_model_info(model: YOLO, model_path: Path, logger: logging.Logger):
+def log_model_info(model: YOLO, model_path: Path, logger: logging.Logger) -> None:
     size_mb = model_path.stat().st_size / (1024 * 1024) if model_path.is_file() else 0.0
     names = model.names if isinstance(model.names, dict) else {}
     num_classes = len(names)
@@ -492,7 +251,7 @@ def smooth_camera_track(
     return cam_x
 
 
-def _release_cuda_cache(device_str: str):
+def _release_cuda_cache(device_str: str) -> None:
     if device_str.startswith("cuda") and torch.cuda.is_available():
         try:
             if ":" in device_str:
@@ -843,8 +602,8 @@ def convert_single_clip(
     }
 
 
-def main():
-    abilita_ansi()
+def main() -> None:
+    enable_ansi_console()
     warnings.filterwarnings("ignore", message=".*'half' is deprecated.*", category=UserWarning)
     logging.getLogger("ultralytics").setLevel(logging.WARNING)
 
@@ -862,11 +621,13 @@ def main():
     args = parser.parse_args()
 
     base_dir = Path(args.base_dir).resolve()
-    dirs, logger, log_file = setup_dirs_and_logger(base_dir)
-    gpu_info = rileva_gpu(args.device, logger)
-    res = calcola_risorse()
+    dirs = ensure_project_dirs(base_dir, include_model_dir=True)
+    logger, log_file = setup_step_logger(dirs["log"], SCRIPT_NAME)
+    gpu_info = detect_gpu_and_encoder(args.device, logger)
+    res = compute_system_resources()
     imgsz = res["imgsz_default"]
     tipo_slug = sanitize_slug(args.tipo)
+    _ = normalize_format(args.formato)
 
     logger.info(
         f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | model='{args.model}' | "
@@ -875,7 +636,8 @@ def main():
         f"auto={args.auto} | risorse={res}"
     )
 
-    if shutil.which("ffmpeg") is None:
+    ffmpeg_ok, _ = check_ffmpeg_tools(require_ffprobe=False)
+    if not ffmpeg_ok:
         print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg non trovato nel PATH.{RESET}", file=sys.stderr)
         logger.error(f"[{SCRIPT_NAME}] FFmpeg non trovato nel PATH.")
         sys.exit(1)

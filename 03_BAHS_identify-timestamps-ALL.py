@@ -2,160 +2,34 @@ import os
 import sys
 import time
 import ctypes
-import shutil
 import logging
 import argparse
-from datetime import datetime
 from pathlib import Path
 import cv2
 from tqdm import tqdm
+
+from bahs_core import (
+    RED,
+    YELLOW,
+    RESET,
+    compute_system_resources,
+    enable_ansi_console,
+    ensure_project_dirs,
+    has_valid_timestamps,
+    normalize_format,
+    read_timestamps_file,
+    resolve_merged_orig_path,
+    resolve_timestamp_files,
+    sanitize_slug,
+    seconds_to_time_str,
+    setup_step_logger,
+    sync_generic_timestamps,
+)
 
 SCRIPT_NAME = "03_BAHS_identify-timestamps-ALL"
 DEFAULT_SPEED = 1.0
 ALLOWED_CHOICES = (2.0, 4.0)
 LARGE_SKIP_FRAMES_THRESHOLD = 6
-
-RESET = "\033[0m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-CYAN = "\033[96m"
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-MAGENTA = "\033[95m"
-
-
-def abilita_ansi():
-    if os.name == "nt":
-        try:
-            k = ctypes.windll.kernel32
-            h = k.GetStdHandle(-11)
-            m = ctypes.c_uint32()
-            if k.GetConsoleMode(h, ctypes.byref(m)):
-                k.SetConsoleMode(h, m.value | 0x0004)
-        except Exception:
-            os.system("")
-
-
-def rileva_ram_gb() -> tuple[float, float]:
-    try:
-        import psutil  # type: ignore
-        vm = psutil.virtual_memory()
-        return round(vm.total / (1024 ** 3), 1), round(vm.available / (1024 ** 3), 1)
-    except Exception:
-        pass
-    if os.name == "nt":
-        try:
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-            st = MEMORYSTATUSEX()
-            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
-            return round(st.ullTotalPhys / (1024 ** 3), 1), round(st.ullAvailPhys / (1024 ** 3), 1)
-        except Exception:
-            return 8.0, 4.0
-    p = Path("/proc/meminfo")
-    if p.is_file():
-        tot = avail = 0
-        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.startswith("MemTotal:"):
-                tot = int(line.split()[1])
-            elif line.startswith("MemAvailable:"):
-                avail = int(line.split()[1])
-        if tot > 0:
-            return round(tot / (1024 ** 2), 1), round((avail or tot // 2) / (1024 ** 2), 1)
-    return 8.0, 4.0
-
-
-def calcola_risorse() -> dict:
-    threads = os.cpu_count() or 4
-    cores = max(2, threads // 2)
-    ram_tot, ram_avail = rileva_ram_gb()
-    return {
-        "threads": threads,
-        "cores": cores,
-        "ram_tot": ram_tot,
-        "ram_avail": ram_avail,
-    }
-
-
-def sanitize_slug(text: str) -> str:
-    cleaned = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in text.strip())
-    while "__" in cleaned:
-        cleaned = cleaned.replace("__", "_")
-    return cleaned.strip("_") or "SESSIONE"
-
-
-def setup_dirs_and_logger(base_dir: Path) -> tuple[dict[str, Path], logging.Logger, Path]:
-    dirs = {
-        "in": base_dir / "IN",
-        "out": base_dir / "OUT",
-        "final": base_dir / "FINAL",
-        "tmp": base_dir / "TMP",
-        "log": base_dir / "LOG",
-        "music": base_dir / "MUSIC",
-        "extra": base_dir / "EXTRA",
-    }
-    for p in dirs.values():
-        p.mkdir(parents=True, exist_ok=True)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = dirs["log"] / f"{SCRIPT_NAME}_{ts}.log"
-
-    logger = logging.getLogger(SCRIPT_NAME)
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    logger.addHandler(fh)
-    return dirs, logger, log_file
-
-
-def leggi_timestamp_salvati(txt_path: Path) -> list[str]:
-    if not txt_path.is_file():
-        return []
-    timestamps: list[str] = []
-    for line in txt_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        for part in s.split(","):
-            t = part.strip()
-            if t:
-                timestamps.append(t)
-    return timestamps
-
-
-def risolvi_file_timestamp(out_dir: Path, tipo_slug: str, fmt_slug: str) -> Path:
-    return out_dir / f"{tipo_slug}_{fmt_slug}_timestamps.txt"
-
-
-def risolvi_file_timestamp_generico(out_dir: Path) -> Path:
-    return out_dir / "timestamps.txt"
-
-
-def sincronizza_timestamp_generico(src_txt: Path, out_dir: Path, logger: logging.Logger, overwrite_generic: bool = False) -> Path:
-    dst_txt = risolvi_file_timestamp_generico(out_dir)
-    if src_txt.resolve() == dst_txt.resolve():
-        return dst_txt
-    if not overwrite_generic and dst_txt.is_file() and dst_txt.stat().st_size > 0 and leggi_timestamp_salvati(dst_txt):
-        logger.info(f"[{SCRIPT_NAME}] Mantenuto file timestamp generico esistente '{dst_txt}'.")
-        return dst_txt
-    if src_txt.is_file() and src_txt.stat().st_size > 0:
-        shutil.copy2(src_txt, dst_txt)
-        logger.info(f"[{SCRIPT_NAME}] Sincronizzato '{src_txt}' su '{dst_txt}'.")
-    return dst_txt
 
 
 def controlla_timestamp_out(out_dir: Path, txt_path: Path, logger: logging.Logger) -> list[str]:
@@ -163,38 +37,12 @@ def controlla_timestamp_out(out_dir: Path, txt_path: Path, logger: logging.Logge
         logger.info(f"[{SCRIPT_NAME}] File timestamp '{txt_path}' non presente in '{out_dir.name}/'.")
         return []
 
-    saved_times = leggi_timestamp_salvati(txt_path)
+    saved_times = read_timestamps_file(txt_path, validate_seconds=False)
     if saved_times:
         logger.info(f"[{SCRIPT_NAME}] File '{txt_path}' presente con {len(saved_times)} timestamp: {saved_times}")
     else:
         logger.warning(f"[{SCRIPT_NAME}] File '{txt_path}' presente ma privo di timestamp validi.")
     return saved_times
-
-
-def risolvi_video_out(out_dir: Path, tipo_slug: str, fmt_slug: str, requested_name: str | None = None) -> Path | None:
-    if requested_name:
-        cand = out_dir / requested_name
-        if cand.is_file():
-            return cand
-        return None
-    primary = out_dir / f"{tipo_slug}_{fmt_slug}_merged_orig.mp4"
-    if primary.is_file():
-        return primary
-    fallback = out_dir / f"merged_orig_{tipo_slug}_{fmt_slug}.mp4"
-    if fallback.is_file():
-        return fallback
-    return None
-
-
-def seconds_to_time_str(seconds: float) -> str:
-    seconds = max(0.0, float(seconds))
-    mins = int(seconds // 60)
-    secs = int(seconds % 60)
-    if mins >= 60:
-        hours = mins // 60
-        mins = mins % 60
-        return f"{hours:02d}:{mins:02d}:{secs:02d}"
-    return f"{mins:02d}:{secs:02d}"
 
 
 def chiedi_velocita(default_speed: float = DEFAULT_SPEED) -> float:
@@ -212,12 +60,28 @@ def chiedi_velocita(default_speed: float = DEFAULT_SPEED) -> float:
         print(f"{RED}[!] Scelta non valida. Premi INVIO per {default_speed:g}x oppure inserisci 2x o 4x.{RESET}")
 
 
-def put_contrasted_text(frame, text: str, org: tuple[int, int], font_scale: float, color: tuple[int, int, int], thickness: int = 2):
+def put_contrasted_text(
+    frame,
+    text: str,
+    org: tuple[int, int],
+    font_scale: float,
+    color: tuple[int, int, int],
+    thickness: int = 2,
+) -> None:
     cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_8)
     cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_8)
 
 
-def draw_overlay(frame, current_sec: float, total_sec: float, speed: float, paused: bool, recorded_times: list[str], flash_active: bool, session_label: str):
+def draw_overlay(
+    frame,
+    current_sec: float,
+    total_sec: float,
+    speed: float,
+    paused: bool,
+    recorded_times: list[str],
+    flash_active: bool,
+    session_label: str,
+):
     h, w, _ = frame.shape
     put_contrasted_text(frame, f"Sessione: {session_label}", (20, 45), 0.9, (0, 255, 255), 2)
 
@@ -268,7 +132,7 @@ def seek_to_seconds(cap, target_sec: float, fps: float, total_frames: int) -> tu
     return True, frame, target_frame, target_frame / fps
 
 
-def porta_in_primo_piano(window_title: str):
+def porta_in_primo_piano(window_title: str) -> None:
     if os.name == "nt":
         try:
             user32 = ctypes.windll.user32
@@ -281,8 +145,8 @@ def porta_in_primo_piano(window_title: str):
             pass
 
 
-def main():
-    abilita_ansi()
+def main() -> None:
+    enable_ansi_console()
 
     parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Identificazione interattiva timestamp canestri")
     parser.add_argument("--base-dir", default=".")
@@ -293,13 +157,12 @@ def main():
     args = parser.parse_args()
 
     base_dir = Path(args.base_dir).resolve()
-    dirs, logger, log_file = setup_dirs_and_logger(base_dir)
-    res = calcola_risorse()
+    dirs = ensure_project_dirs(base_dir)
+    logger, log_file = setup_step_logger(dirs["log"], SCRIPT_NAME)
+    res = compute_system_resources()
 
     tipo_slug = sanitize_slug(args.tipo)
-    fmt_slug = args.formato.strip().upper()
-    if fmt_slug not in ("1080P", "REEL"):
-        fmt_slug = "1080P"
+    fmt_slug = normalize_format(args.formato)
 
     default_session = f"{tipo_slug}_{fmt_slug}_{sanitize_slug(args.sottotitolo)}"
 
@@ -308,11 +171,11 @@ def main():
         f"sottotitolo='{args.sottotitolo}' | formato='{fmt_slug}' | auto={args.auto} | risorse={res}"
     )
 
-    generic_txt = risolvi_file_timestamp_generico(dirs["out"])
-    if tipo_slug.upper() == "HIGHLIGHTS" and fmt_slug == "REEL" and generic_txt.is_file() and leggi_timestamp_salvati(generic_txt):
+    specific_txt, generic_txt = resolve_timestamp_files(dirs["out"], tipo_slug, fmt_slug)
+    if tipo_slug.upper() == "HIGHLIGHTS" and fmt_slug == "REEL" and has_valid_timestamps(generic_txt):
         txt_path = generic_txt
     else:
-        txt_path = risolvi_file_timestamp(dirs["out"], tipo_slug, fmt_slug)
+        txt_path = specific_txt
 
     existing_timestamps = controlla_timestamp_out(dirs["out"], txt_path, logger)
 
@@ -331,7 +194,7 @@ def main():
             sc = input("👉 Scelta [INVIO = 2 Salta]: ").strip()
             if sc in ("", "2"):
                 if existing_timestamps:
-                    sincronizza_timestamp_generico(txt_path, dirs["out"], logger, overwrite_generic=False)
+                    sync_generic_timestamps(txt_path, dirs["out"], logger, overwrite_generic=False)
                 logger.info(f"[{SCRIPT_NAME}] Completato (SKIP): mantenuto '{txt_path}'.")
                 return
             if sc == "1":
@@ -346,7 +209,7 @@ def main():
 
     default_video_name = f"{tipo_slug}_{fmt_slug}_merged_orig.mp4"
     video_name = input(f"📁 Nome video in 'OUT/' [INVIO = {default_video_name}]: ").strip()
-    video_path = risolvi_video_out(dirs["out"], tipo_slug, fmt_slug, video_name or None)
+    video_path = resolve_merged_orig_path(dirs["out"], tipo_slug, fmt_slug, video_name or None)
     if not video_path:
         print(f"{RED}[X] [{SCRIPT_NAME}] Video non trovato in 'OUT/': {video_name or default_video_name}{RESET}", file=sys.stderr)
         logger.error(f"[{SCRIPT_NAME}] Video non trovato in OUT (richiesto='{video_name or default_video_name}').")
@@ -517,7 +380,7 @@ def main():
         content = f"# Sessione: {session_label} | Script: {SCRIPT_NAME}\n" + "\n".join(recorded_times) + "\n"
         txt_path.write_text(content, encoding="utf-8")
         logger.info(f"[{SCRIPT_NAME}] Salvati {len(recorded_times)} timestamp in '{txt_path}': {recorded_times}")
-        sincronizza_timestamp_generico(txt_path, dirs["out"], logger, overwrite_generic=overwrite_mode)
+        sync_generic_timestamps(txt_path, dirs["out"], logger, overwrite_generic=overwrite_mode)
     else:
         print(f"{YELLOW}[!] [{SCRIPT_NAME}] Nessun timestamp registrato (log: {log_file.name}).{RESET}", file=sys.stderr)
         logger.warning(f"[{SCRIPT_NAME}] Sessione terminata senza timestamp registrati.")

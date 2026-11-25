@@ -1,19 +1,35 @@
 import os
 import sys
 import json
-import ctypes
 import shutil
 import logging
 import argparse
 import threading
 import subprocess
-from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 
+from bahs_core import (
+    BOLD,
+    DEFAULT_SUB_TEXT,
+    DEFAULT_TOP_TEXT,
+    FONT_EXTS,
+    LOGO_EXTS,
+    RED,
+    RESET,
+    YELLOW,
+    build_stage_name,
+    check_ffmpeg_tools,
+    cleanup_temp_paths,
+    compute_system_resources,
+    enable_ansi_console,
+    ensure_project_dirs,
+    normalize_format,
+    sanitize_slug,
+    setup_step_logger,
+)
+
 SCRIPT_NAME = "11_BAHS_add-text-logo-overlay-ALL"
-FONT_EXTS = (".ttf",)
-LOGO_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 
 # Formato 1080P (1920x1080)
 FHD_WIDTH = 1920
@@ -29,112 +45,11 @@ REEL_LOGO_WIDTH = 98
 REEL_LOGO_MARGIN_X = 36
 REEL_LOGO_MARGIN_Y = 48
 
-DEFAULT_TOP_TEXT = "HIGHLIGHTS"
-DEFAULT_SUB_TEXT = "CAMPIONATO - TEAM vs TEAM"
 TEXT_DISPLAY_DURATION_SEC = 15.0
-
-RESET = "\033[0m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-CYAN = "\033[96m"
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-
-
-def abilita_ansi():
-    if os.name == "nt":
-        try:
-            k = ctypes.windll.kernel32
-            h = k.GetStdHandle(-11)
-            m = ctypes.c_uint32()
-            if k.GetConsoleMode(h, ctypes.byref(m)):
-                k.SetConsoleMode(h, m.value | 0x0004)
-        except Exception:
-            os.system("")
-
-
-def rileva_ram_gb() -> tuple[float, float]:
-    try:
-        import psutil  # type: ignore
-        vm = psutil.virtual_memory()
-        return round(vm.total / (1024 ** 3), 1), round(vm.available / (1024 ** 3), 1)
-    except Exception:
-        pass
-    if os.name == "nt":
-        try:
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-            st = MEMORYSTATUSEX()
-            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
-            return round(st.ullTotalPhys / (1024 ** 3), 1), round(st.ullAvailPhys / (1024 ** 3), 1)
-        except Exception:
-            return 8.0, 4.0
-    p = Path("/proc/meminfo")
-    if p.is_file():
-        tot = avail = 0
-        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.startswith("MemTotal:"):
-                tot = int(line.split()[1])
-            elif line.startswith("MemAvailable:"):
-                avail = int(line.split()[1])
-        if tot > 0:
-            return round(tot / (1024 ** 2), 1), round((avail or tot // 2) / (1024 ** 2), 1)
-    return 8.0, 4.0
-
-
-def calcola_risorse() -> dict:
-    threads = os.cpu_count() or 4
-    cores = max(2, threads // 2)
-    ram_tot, ram_avail = rileva_ram_gb()
-    preset = "veryfast" if (threads <= 4 or ram_avail < 6.0) else "fast"
-    return {
-        "threads": threads,
-        "cores": cores,
-        "ram_tot": ram_tot,
-        "ram_avail": ram_avail,
-        "preset": preset,
-    }
-
-
-def sanitize_slug(text: str) -> str:
-    cleaned = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in text.strip())
-    while "__" in cleaned:
-        cleaned = cleaned.replace("__", "_")
-    return cleaned.strip("_") or "INCONTRO"
 
 
 def is_non_highlights_mode(tipo_raw: str) -> bool:
     return tipo_raw.strip().upper() != "HIGHLIGHTS"
-
-
-def build_stage_name(
-    tipo_slug: str,
-    fmt_slug: str,
-    fade: bool = True,
-    music: bool = False,
-    text: bool = False,
-    logo: bool = False,
-) -> str:
-    parts = [tipo_slug, fmt_slug, "with", "fade" if fade else "nofade"]
-    if music:
-        parts.append("music")
-    if text:
-        parts.append("text")
-    if logo:
-        parts.append("logo")
-    return "_".join(parts) + ".mp4"
 
 
 def parse_video_flags(video_path: Path) -> tuple[bool, bool]:
@@ -155,32 +70,6 @@ def escape_drawtext(text: str) -> str:
 def escape_drawtext_fontfile(font_path: Path) -> str:
     posix_path = font_path.resolve().as_posix()
     return posix_path.replace(":", "\\:").replace("'", "\\'")
-
-
-def setup_dirs_and_logger(base_dir: Path) -> tuple[dict[str, Path], logging.Logger, Path]:
-    dirs = {
-        "in": base_dir / "IN",
-        "out": base_dir / "OUT",
-        "final": base_dir / "FINAL",
-        "tmp": base_dir / "TMP",
-        "log": base_dir / "LOG",
-        "music": base_dir / "MUSIC",
-        "extra": base_dir / "EXTRA",
-    }
-    for p in dirs.values():
-        p.mkdir(parents=True, exist_ok=True)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = dirs["log"] / f"{SCRIPT_NAME}_{ts}.log"
-
-    logger = logging.getLogger(SCRIPT_NAME)
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    logger.addHandler(fh)
-    return dirs, logger, log_file
 
 
 def probe_media_dimensions(media_path: Path, is_video: bool = True) -> dict:
@@ -373,8 +262,8 @@ def select_input_video(
     if is_non_highlights_mode(tipo_raw):
         candidates.append(out_dir / f"{tipo_slug}_1080P_merged_orig.mp4")
 
-    existing = []
-    seen = set()
+    existing: list[Path] = []
+    seen: set[Path] = set()
     for p in candidates:
         if p.is_file() and p.resolve() not in seen:
             existing.append(p)
@@ -397,7 +286,7 @@ def select_input_video(
         print(f"{RED}[!] Scelta non valida.{RESET}")
 
 
-def append_audio_output_args(cmd: list[str], vid_info: dict):
+def append_audio_output_args(cmd: list[str], vid_info: dict) -> None:
     if not vid_info["has_audio"]:
         return
     if vid_info["audio_codec"] == "aac":
@@ -537,8 +426,8 @@ def build_combined_cmd(
     return cmd
 
 
-def main():
-    abilita_ansi()
+def main() -> None:
+    enable_ansi_console()
 
     parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Sovraimpressione testo e logo in singolo passaggio")
     parser.add_argument("--base-dir", default=".")
@@ -550,13 +439,11 @@ def main():
     args = parser.parse_args()
 
     base_dir = Path(args.base_dir).resolve()
-    dirs, logger, log_file = setup_dirs_and_logger(base_dir)
-    res = calcola_risorse()
+    dirs = ensure_project_dirs(base_dir)
+    logger, log_file = setup_step_logger(dirs["log"], SCRIPT_NAME)
+    res = compute_system_resources()
 
-    fmt_slug = args.formato.strip().upper()
-    if fmt_slug not in ("1080P", "REEL"):
-        fmt_slug = "1080P"
-
+    fmt_slug = normalize_format(args.formato)
     tipo_slug = sanitize_slug(args.tipo)
     pid = os.getpid()
 
@@ -566,7 +453,8 @@ def main():
         f"auto={args.auto} | risorse={res}"
     )
 
-    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+    ffmpeg_ok, _ = check_ffmpeg_tools(require_ffprobe=True)
+    if not ffmpeg_ok:
         print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.{RESET}", file=sys.stderr)
         logger.error(f"[{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.")
         sys.exit(1)
@@ -680,13 +568,7 @@ def main():
         size_mb = out_file.stat().st_size / (1024 * 1024)
         logger.info(f"[{SCRIPT_NAME}] Completato con successo: '{out_file}' ({size_mb:.2f} MB)")
     finally:
-        if tmp_font and tmp_font.exists():
-            try:
-                tmp_font.unlink()
-            except Exception:
-                pass
-        if tmp_out_file.exists():
-            tmp_out_file.unlink(missing_ok=True)
+        cleanup_temp_paths([p for p in (tmp_font, tmp_out_file) if p is not None], logger)
 
 
 if __name__ == "__main__":

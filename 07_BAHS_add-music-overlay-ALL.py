@@ -1,148 +1,46 @@
 import os
 import re
 import sys
-import ctypes
-import shutil
 import logging
 import argparse
 import threading
 import subprocess
-from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
+
+from bahs_core import (
+    AUDIO_EXTS,
+    BOLD,
+    NO_MUSIC_TYPES,
+    RED,
+    RESET,
+    YELLOW,
+    build_stage_name,
+    check_ffmpeg_tools,
+    cleanup_temp_paths,
+    compute_system_resources,
+    enable_ansi_console,
+    ensure_project_dirs,
+    normalize_format,
+    sanitize_slug,
+    setup_step_logger,
+)
 
 SCRIPT_NAME = "07_BAHS_add-music-overlay-ALL"
 MUSIC_VOLUME = 0.6
 ORIGINAL_AUDIO_VOLUME = 0.4
 MUSIC_FADE_OUT_SEC = 1.0
-AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
-
-RESET = "\033[0m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-CYAN = "\033[96m"
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
-
-
-def abilita_ansi():
-    if os.name == "nt":
-        try:
-            k = ctypes.windll.kernel32
-            h = k.GetStdHandle(-11)
-            m = ctypes.c_uint32()
-            if k.GetConsoleMode(h, ctypes.byref(m)):
-                k.SetConsoleMode(h, m.value | 0x0004)
-        except Exception:
-            os.system("")
-
-
-def rileva_ram_gb() -> tuple[float, float]:
-    try:
-        import psutil  # type: ignore
-        vm = psutil.virtual_memory()
-        return round(vm.total / (1024 ** 3), 1), round(vm.available / (1024 ** 3), 1)
-    except Exception:
-        pass
-    if os.name == "nt":
-        try:
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-            st = MEMORYSTATUSEX()
-            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
-            return round(st.ullTotalPhys / (1024 ** 3), 1), round(st.ullAvailPhys / (1024 ** 3), 1)
-        except Exception:
-            return 8.0, 4.0
-    p = Path("/proc/meminfo")
-    if p.is_file():
-        tot = avail = 0
-        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.startswith("MemTotal:"):
-                tot = int(line.split()[1])
-            elif line.startswith("MemAvailable:"):
-                avail = int(line.split()[1])
-        if tot > 0:
-            return round(tot / (1024 ** 2), 1), round((avail or tot // 2) / (1024 ** 2), 1)
-    return 8.0, 4.0
-
-
-def calcola_risorse() -> dict:
-    threads = os.cpu_count() or 4
-    cores = max(2, threads // 2)
-    ram_tot, ram_avail = rileva_ram_gb()
-    return {
-        "threads": threads,
-        "cores": cores,
-        "ram_tot": ram_tot,
-        "ram_avail": ram_avail,
-    }
-
-
-def sanitize_slug(text: str) -> str:
-    cleaned = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in text.strip())
-    while "__" in cleaned:
-        cleaned = cleaned.replace("__", "_")
-    return cleaned.strip("_") or "INCONTRO"
 
 
 def is_non_highlights_mode(tipo_raw: str) -> bool:
     return tipo_raw.strip().upper() != "HIGHLIGHTS"
 
 
-def build_stage_name(tipo_slug: str, fmt_slug: str, fade: bool = True, music: bool = False, text: bool = False, logo: bool = False) -> str:
-    parts = [tipo_slug, fmt_slug, "with", "fade" if fade else "nofade"]
-    if music:
-        parts.append("music")
-    if text:
-        parts.append("text")
-    if logo:
-        parts.append("logo")
-    return "_".join(parts) + ".mp4"
-
-
 def extract_fade_flag(video_path: Path, default_fade: bool = True) -> bool:
-    m = re.search(r"_with_(nofade|fade)(?:_|\.mp4$)", video_path.name, re.IGNORECASE)
-    if m:
-        return m.group(1).lower() == "fade"
+    match = re.search(r"_with_(nofade|fade)(?:_|\.mp4$)", video_path.name, re.IGNORECASE)
+    if match:
+        return match.group(1).lower() == "fade"
     return default_fade
-
-
-def setup_dirs_and_logger(base_dir: Path) -> tuple[dict[str, Path], logging.Logger, Path]:
-    dirs = {
-        "in": base_dir / "IN",
-        "out": base_dir / "OUT",
-        "final": base_dir / "FINAL",
-        "tmp": base_dir / "TMP",
-        "log": base_dir / "LOG",
-        "music": base_dir / "MUSIC",
-        "extra": base_dir / "EXTRA",
-    }
-    for p in dirs.values():
-        p.mkdir(parents=True, exist_ok=True)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = dirs["log"] / f"{SCRIPT_NAME}_{ts}.log"
-
-    logger = logging.getLogger(SCRIPT_NAME)
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    logger.addHandler(fh)
-    return dirs, logger, log_file
 
 
 def probe_media_info(video_path: Path) -> tuple[int, bool]:
@@ -235,7 +133,15 @@ def gestione_file_esistente(out_file: Path, auto: bool, logger: logging.Logger) 
         print(f"{RED}[!] Scelta non valida.{RESET}")
 
 
-def select_input_video(out_dir: Path, final_dir: Path, tmp_dir: Path, tipo_raw: str, tipo_slug: str, fmt_slug: str, auto: bool) -> Path | None:
+def select_input_video(
+    out_dir: Path,
+    final_dir: Path,
+    tmp_dir: Path,
+    tipo_raw: str,
+    tipo_slug: str,
+    fmt_slug: str,
+    auto: bool,
+) -> Path | None:
     if is_non_highlights_mode(tipo_raw):
         candidates_non_hl = [
             out_dir / f"{tipo_slug}_{fmt_slug}_merged_orig.mp4",
@@ -252,8 +158,8 @@ def select_input_video(out_dir: Path, final_dir: Path, tmp_dir: Path, tipo_raw: 
         tmp_dir / build_stage_name(tipo_slug, fmt_slug, fade=False),
         final_dir / build_stage_name(tipo_slug, fmt_slug, fade=False),
     ]
-    existing = []
-    seen = set()
+    existing: list[Path] = []
+    seen: set[Path] = set()
     for p in candidates:
         if p.is_file() and p.resolve() not in seen:
             existing.append(p)
@@ -296,8 +202,8 @@ def attendi_brani_in_cartella_music(music_dir: Path, logger: logging.Logger) -> 
             sys.exit(1)
 
 
-def main():
-    abilita_ansi()
+def main() -> None:
+    enable_ansi_console()
 
     parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Mix musica di sottofondo sul video unito")
     parser.add_argument("--base-dir", default=".")
@@ -308,20 +214,24 @@ def main():
     args = parser.parse_args()
 
     base_dir = Path(args.base_dir).resolve()
-    dirs, logger, log_file = setup_dirs_and_logger(base_dir)
-    res = calcola_risorse()
+    dirs = ensure_project_dirs(base_dir)
+    logger, log_file = setup_step_logger(dirs["log"], SCRIPT_NAME)
+    res = compute_system_resources()
 
     tipo_slug = sanitize_slug(args.tipo)
-    fmt_slug = args.formato.strip().upper()
-    if fmt_slug not in ("1080P", "REEL"):
-        fmt_slug = "1080P"
+    fmt_slug = normalize_format(args.formato)
 
     logger.info(
         f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | formato='{fmt_slug}' | "
         f"auto={args.auto} | vol_music={MUSIC_VOLUME} | vol_orig={ORIGINAL_AUDIO_VOLUME} | risorse={res}"
     )
 
-    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+    if args.tipo.strip().upper() in NO_MUSIC_TYPES:
+        logger.info(f"[{SCRIPT_NAME}] Tipo '{args.tipo}' in NO_MUSIC_TYPES: step musica saltato.")
+        return
+
+    ffmpeg_ok, _ = check_ffmpeg_tools(require_ffprobe=True)
+    if not ffmpeg_ok:
         print(f"{RED}[X] [{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.{RESET}", file=sys.stderr)
         logger.error(f"[{SCRIPT_NAME}] FFmpeg o FFprobe non trovati nel PATH.")
         sys.exit(1)
@@ -430,8 +340,7 @@ def main():
         size_mb = out_file.stat().st_size / (1024 * 1024)
         logger.info(f"[{SCRIPT_NAME}] Completato con successo: '{out_file}' ({size_mb:.2f} MB, musica='{selected_music.name}')")
     finally:
-        if tmp_out_file.exists():
-            tmp_out_file.unlink(missing_ok=True)
+        cleanup_temp_paths([tmp_out_file], logger)
 
 
 if __name__ == "__main__":
