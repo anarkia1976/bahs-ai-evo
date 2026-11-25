@@ -14,6 +14,7 @@ from tqdm import tqdm
 SCRIPT_NAME = "07_BAHS_add-music-overlay-ALL"
 MUSIC_VOLUME = 0.6
 ORIGINAL_AUDIO_VOLUME = 0.4
+MUSIC_FADE_OUT_SEC = 1.0
 AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
 
 RESET = "\033[0m"
@@ -182,6 +183,32 @@ def parse_progress_ms(line: str) -> int | None:
     return None
 
 
+def build_music_filter_complex(total_ms: int, has_orig_audio: bool, apply_fade_out: bool = True) -> tuple[str, str | None]:
+    mus_chain = f"[1:a]volume={MUSIC_VOLUME}"
+    fade_desc: str | None = None
+
+    if apply_fade_out and total_ms > 100:
+        total_sec = total_ms / 1000.0
+        fade_dur = min(MUSIC_FADE_OUT_SEC, total_sec * 0.45)
+        if fade_dur > 0.05:
+            start_sec = max(0.0, total_sec - fade_dur)
+            mus_chain += f",afade=t=out:st={start_sec:.3f}:d={fade_dur:.3f}"
+            fade_desc = f"st={start_sec:.2f}s,d={fade_dur:.2f}s"
+
+    mus_chain += "[mus]"
+
+    if has_orig_audio:
+        fc = (
+            f"[0:a]volume={ORIGINAL_AUDIO_VOLUME}[orig];"
+            f"{mus_chain};"
+            f"[orig][mus]amix=inputs=2:duration=first:normalize=0:dropout_transition=2[aout]"
+        )
+    else:
+        fc = f"{mus_chain.replace('[mus]', '[aout]')}"
+
+    return fc, fade_desc
+
+
 def gestione_file_esistente(out_file: Path, auto: bool, logger: logging.Logger) -> str:
     if not out_file.is_file() or out_file.stat().st_size == 0:
         return "overwrite"
@@ -327,19 +354,11 @@ def main():
     music_files = attendi_brani_in_cartella_music(dirs["music"], logger)
     selected_music = music_files[0]
     total_ms, has_orig_audio = probe_media_info(in_video)
+    filter_complex, fade_desc = build_music_filter_complex(total_ms, has_orig_audio, apply_fade_out=True)
     logger.info(
         f"[{SCRIPT_NAME}] Traccia audio selezionata='{selected_music}' | "
-        f"durata_video_ms={total_ms} | orig_has_audio={has_orig_audio}"
+        f"durata_video_ms={total_ms} | orig_has_audio={has_orig_audio} | music_fade_out={fade_desc or 'off'}"
     )
-
-    if has_orig_audio:
-        filter_complex = (
-            f"[0:a]volume={ORIGINAL_AUDIO_VOLUME}[orig];"
-            f"[1:a]volume={MUSIC_VOLUME}[mus];"
-            f"[orig][mus]amix=inputs=2:duration=first:normalize=0:dropout_transition=2[aout]"
-        )
-    else:
-        filter_complex = f"[1:a]volume={MUSIC_VOLUME}[aout]"
 
     cmd = [
         "ffmpeg",
