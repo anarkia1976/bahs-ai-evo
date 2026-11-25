@@ -41,12 +41,12 @@ def disabilita_quick_edit_windows():
     if os.name == "nt":
         try:
             k = ctypes.windll.kernel32
-            h_in = k.GetStdHandle(-10)  # STD_INPUT_HANDLE
+            h_in = k.GetStdHandle(-10)
             mode = ctypes.c_uint32()
             if k.GetConsoleMode(h_in, ctypes.byref(mode)):
-                ENABLE_QUICK_EDIT_MODE = 0x0040
-                ENABLE_EXTENDED_FLAGS = 0x0080
-                new_mode = (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+                enable_quick_edit_mode = 0x0040
+                enable_extended_flags = 0x0080
+                new_mode = (mode.value & ~enable_quick_edit_mode) | enable_extended_flags
                 k.SetConsoleMode(h_in, new_mode)
         except Exception:
             pass
@@ -103,11 +103,11 @@ def calcola_risorse() -> dict:
         preset = "veryfast"
     elif threads <= 8 or ram_avail < 12.0:
         max_workers = min(4, cores)
-        threads_per_worker = 2
+        threads_per_worker = max(1, min(3, threads // max_workers))
         preset = "fast"
     else:
-        max_workers = min(cores, 8)
-        threads_per_worker = min(4, max(2, threads // max_workers))
+        max_workers = min(cores, 6)
+        threads_per_worker = max(1, min(4, threads // max_workers))
         preset = "fast"
 
     return {
@@ -168,13 +168,23 @@ def get_video_duration(video_path: Path) -> float | None:
         return None
 
 
-def time_to_seconds(time_str: str) -> float:
-    parts = [float(x) for x in time_str.strip().split(":")]
+def time_to_seconds(time_str: str) -> float | None:
+    raw_parts = [p.strip().replace(",", ".") for p in time_str.strip().split(":")]
+    if not raw_parts or any(not p for p in raw_parts):
+        return None
+    try:
+        parts = [float(x) for x in raw_parts]
+    except ValueError:
+        return None
+    if any(x < 0 for x in parts):
+        return None
     if len(parts) == 3:
         return parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]
     if len(parts) == 2:
         return parts[0] * 60.0 + parts[1]
-    return parts[0]
+    if len(parts) == 1:
+        return parts[0]
+    return None
 
 
 def load_timestamps(dir_out: Path, tipo_slug: str, fmt_slug: str) -> tuple[list[str] | None, Path | None]:
@@ -191,16 +201,14 @@ def load_timestamps(dir_out: Path, tipo_slug: str, fmt_slug: str) -> tuple[list[
         if not s or s.startswith("#"):
             continue
         for p in s.split(","):
-            if p.strip():
-                times.append(p.strip())
+            token = p.strip()
+            if token and time_to_seconds(token) is not None:
+                times.append(token)
     return (times if times else None), txt_path
 
 
 def trova_clip_esistenti(dir_out: Path, tipo_slug: str, fmt_slug: str) -> list[Path]:
-    uniform_clips = sorted(dir_out.glob(f"{tipo_slug}_{fmt_slug}_clip_*.mp4"))
-    if uniform_clips:
-        return uniform_clips
-    return sorted(dir_out.glob(f"canestro_*_{tipo_slug}_1080p.mp4"))
+    return sorted(dir_out.glob(f"{tipo_slug}_{fmt_slug}_clip_*.mp4"))
 
 
 def risolvi_video_sorgente(dir_out: Path, tipo_slug: str, fmt_slug: str, requested_name: str | None = None) -> Path | None:
@@ -211,7 +219,6 @@ def risolvi_video_sorgente(dir_out: Path, tipo_slug: str, fmt_slug: str, request
     candidates = [
         dir_out / f"{tipo_slug}_{fmt_slug}_merged_orig.mp4",
         dir_out / f"merged_orig_{tipo_slug}_{fmt_slug}.mp4",
-        dir_out / "video_finale.mp4",
     ]
     return next((p for p in candidates if p.is_file()), None)
 
@@ -237,9 +244,22 @@ def chiedi_tempi_taglio(default_before: float = DEFAULT_BUFFER_BEFORE, default_a
     return before_val, after_val
 
 
-def extract_clip(input_video: Path, timestamp: str, out_clip: Path, buffer_before: float, duration: float, res: dict, logger: logging.Logger) -> tuple[bool, str]:
+def extract_clip(
+    input_video: Path,
+    timestamp: str,
+    out_clip: Path,
+    tmp_dir: Path,
+    buffer_before: float,
+    duration: float,
+    res: dict,
+    logger: logging.Logger,
+) -> tuple[bool, str]:
     center_sec = time_to_seconds(timestamp)
+    if center_sec is None:
+        return False, f"{out_clip.name}: timestamp non valido ('{timestamp}')"
+
     start_sec = max(0.0, center_sec - buffer_before)
+    tmp_clip = tmp_dir / f"{out_clip.stem}_{os.getpid()}_{threading.get_ident()}.part.mp4"
 
     cmd = [
         "ffmpeg",
@@ -251,20 +271,77 @@ def extract_clip(input_video: Path, timestamp: str, out_clip: Path, buffer_befor
         "-c:v", "libx264",
         "-preset", res["preset"],
         "-crf", "18",
+        "-pix_fmt", "yuv420p",
         "-threads", str(res["threads_per_worker"]),
         "-c:a", "aac",
-        "-b:a", "320k",
+        "-b:a", "192k",
         "-avoid_negative_ts", "make_zero",
         "-y",
-        str(out_clip),
+        str(tmp_clip),
     ]
-    proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.returncode == 0 and out_clip.is_file() and out_clip.stat().st_size > 0:
-        logger.info(f"[{SCRIPT_NAME}] Clip creata: '{out_clip.name}' (ts={timestamp}, start={start_sec:.2f}s, dur={duration:.2f}s)")
-        return True, ""
-    err_detail = proc.stderr.strip() or f"returncode={proc.returncode}"
-    logger.error(f"[{SCRIPT_NAME}] Errore taglio clip '{out_clip.name}' (ts={timestamp}, rc={proc.returncode}): {err_detail}")
-    return False, f"{out_clip.name}: {err_detail}"
+    try:
+        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode == 0 and tmp_clip.is_file() and tmp_clip.stat().st_size > 0:
+            os.replace(tmp_clip, out_clip)
+            logger.info(f"[{SCRIPT_NAME}] Clip creata: '{out_clip.name}' (ts={timestamp}, start={start_sec:.2f}s, dur={duration:.2f}s)")
+            return True, ""
+        err_detail = proc.stderr.strip() or f"returncode={proc.returncode}"
+        logger.error(f"[{SCRIPT_NAME}] Errore taglio clip '{out_clip.name}' (ts={timestamp}, rc={proc.returncode}): {err_detail}")
+        return False, f"{out_clip.name}: {err_detail}"
+    finally:
+        if tmp_clip.exists():
+            try:
+                tmp_clip.unlink()
+            except Exception:
+                pass
+
+
+def esegui_taglio_parallelo(
+    video_path: Path,
+    basket_times: list[str],
+    dirs: dict[str, Path],
+    tipo_slug: str,
+    fmt_slug: str,
+    buffer_before: float,
+    clip_duration: float,
+    res: dict,
+    logger: logging.Logger,
+) -> tuple[int, int, list[str]]:
+    ok_cnt = err_cnt = 0
+    errors_list: list[str] = []
+    bar_lock = threading.Lock()
+
+    with ThreadPoolExecutor(max_workers=res["max_workers"]) as pool:
+        futures = {}
+        for idx, ts in enumerate(basket_times, start=1):
+            ts_slug = ts.replace(":", "-")
+            out_clip = dirs["out"] / f"{tipo_slug}_{fmt_slug}_clip_{idx:02d}_{ts_slug}.mp4"
+            fut = pool.submit(
+                extract_clip,
+                video_path,
+                ts,
+                out_clip,
+                dirs["tmp"],
+                buffer_before,
+                clip_duration,
+                res,
+                logger,
+            )
+            futures[fut] = out_clip.name
+
+        with tqdm(total=len(basket_times), desc="04 | Taglio Clip", unit="clip", colour="blue", ncols=78) as bar:
+            for fut in as_completed(futures):
+                ok, err_msg = fut.result()
+                with bar_lock:
+                    if ok:
+                        ok_cnt += 1
+                    else:
+                        err_cnt += 1
+                        errors_list.append(err_msg)
+                    bar.set_postfix({"ok": ok_cnt, "err": err_cnt})
+                    bar.update(1)
+
+    return ok_cnt, err_cnt, errors_list
 
 
 def main():
@@ -316,7 +393,9 @@ def main():
                 logger.info(f"[{SCRIPT_NAME}] Scelta utente: mantieni {len(existing_clips)} clip esistenti.")
                 return
             if sc == "1":
-                logger.info(f"[{SCRIPT_NAME}] Scelta utente: rigenerazione clip.")
+                logger.info(f"[{SCRIPT_NAME}] Scelta utente: rigenerazione clip (rimozione {len(existing_clips)} clip precedenti).")
+                for old_clip in existing_clips:
+                    old_clip.unlink(missing_ok=True)
                 break
             if sc == "3":
                 print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
@@ -339,14 +418,14 @@ def main():
 
     basket_times, ts_source_path = load_timestamps(dirs["out"], tipo_slug, fmt_slug)
     if not basket_times:
-        print(f"{RED}[X] [{SCRIPT_NAME}] Nessun timestamp trovato in 'OUT/' ({tipo_slug}_{fmt_slug}_timestamps.txt o timestamps.txt).{RESET}", file=sys.stderr)
-        logger.error(f"[{SCRIPT_NAME}] Timestamp mancanti o vuoti in '{dirs['out']}'.")
+        print(f"{RED}[X] [{SCRIPT_NAME}] Nessun timestamp valido trovato in 'OUT/' ({tipo_slug}_{fmt_slug}_timestamps.txt o timestamps.txt).{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] Timestamp mancanti o non validi in '{dirs['out']}'.")
         sys.exit(1)
 
     vid_dur = get_video_duration(video_path)
     logger.info(f"[{SCRIPT_NAME}] Video sorgente='{video_path}' (durata={vid_dur}) | file_ts='{ts_source_path}' (voci={len(basket_times)})")
     if vid_dur:
-        valid_times = [t for t in basket_times if time_to_seconds(t) <= vid_dur]
+        valid_times = [t for t in basket_times if (time_to_seconds(t) or 0.0) <= vid_dur]
         if len(valid_times) != len(basket_times):
             logger.warning(f"[{SCRIPT_NAME}] Scartati {len(basket_times) - len(valid_times)} timestamp oltre durata video ({vid_dur:.2f}s).")
         basket_times = valid_times
@@ -367,28 +446,17 @@ def main():
         f"su {res['max_workers']} worker (threads_per_worker={res['threads_per_worker']})."
     )
 
-    ok_cnt = err_cnt = 0
-    errors_list: list[str] = []
-    bar_lock = threading.Lock()
-    with ThreadPoolExecutor(max_workers=res["max_workers"]) as pool:
-        futures = {}
-        for idx, ts in enumerate(basket_times, start=1):
-            ts_slug = ts.replace(":", "-")
-            out_clip = dirs["out"] / f"{tipo_slug}_{fmt_slug}_clip_{idx:02d}_{ts_slug}.mp4"
-            fut = pool.submit(extract_clip, video_path, ts, out_clip, buffer_before, clip_duration, res, logger)
-            futures[fut] = out_clip.name
-
-        with tqdm(total=len(basket_times), desc="04 | Taglio Clip", unit="clip", colour="blue", ncols=78) as bar:
-            for fut in as_completed(futures):
-                ok, err_msg = fut.result()
-                with bar_lock:
-                    if ok:
-                        ok_cnt += 1
-                    else:
-                        err_cnt += 1
-                        errors_list.append(err_msg)
-                    bar.set_postfix({"ok": ok_cnt, "err": err_cnt})
-                    bar.update(1)
+    ok_cnt, err_cnt, errors_list = esegui_taglio_parallelo(
+        video_path=video_path,
+        basket_times=basket_times,
+        dirs=dirs,
+        tipo_slug=tipo_slug,
+        fmt_slug=fmt_slug,
+        buffer_before=buffer_before,
+        clip_duration=clip_duration,
+        res=res,
+        logger=logger,
+    )
 
     logger.info(f"[{SCRIPT_NAME}] Completato: ok={ok_cnt}/{len(basket_times)}, err={err_cnt}")
 
