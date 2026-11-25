@@ -465,10 +465,9 @@ def costruisci_pipeline(base_dir: Path, tipo_incontro: str, formato: str, logger
         ]
         if tipo_upper not in NO_MUSIC_TYPES:
             steps.append({"script": "07_BAHS_add-music-overlay-ALL.py", "label": "Add music overlay (AUTO)", "interactive": False})
-        steps.extend([
-            {"script": "08_BAHS_add-text-overlay-ALL.py", "label": f"Add text overlay {fmt_upper} (AUTO)", "interactive": False},
-            {"script": "10_BAHS_add-logo-overlay-ALL.py", "label": f"Add logo overlay {fmt_upper} (AUTO)", "interactive": False},
-        ])
+        steps.append(
+            {"script": "11_BAHS_add-text-logo-overlay-ALL.py", "label": f"Add text & logo overlay {fmt_upper} (AUTO)", "interactive": False}
+        )
         for idx, s in enumerate(steps, start=1):
             s["step"] = idx
         return steps
@@ -489,8 +488,7 @@ def costruisci_pipeline(base_dir: Path, tipo_incontro: str, formato: str, logger
             {"script": "05_BAHS_convert-clips-REEL.py", "label": "Convert clips to REEL (AUTO)", "interactive": False},
             {"script": "06_BAHS_merge-clips-ALL.py", "label": "Merge clips REEL (AUTO)", "interactive": False},
             {"script": "07_BAHS_add-music-overlay-ALL.py", "label": "Add music overlay (AUTO)", "interactive": False},
-            {"script": "08_BAHS_add-text-overlay-ALL.py", "label": "Add text overlay REEL (AUTO)", "interactive": False},
-            {"script": "10_BAHS_add-logo-overlay-ALL.py", "label": "Add logo overlay REEL (AUTO)", "interactive": False},
+            {"script": "11_BAHS_add-text-logo-overlay-ALL.py", "label": "Add text & logo overlay REEL (AUTO)", "interactive": False},
         ])
         for idx, s in enumerate(raw_steps, start=1):
             s["step"] = idx
@@ -505,8 +503,7 @@ def costruisci_pipeline(base_dir: Path, tipo_incontro: str, formato: str, logger
         {"script": "04_BAHS_split-original-ALL.py", "label": "Split originals (AUTO)", "interactive": False},
         {"script": "06_BAHS_merge-clips-ALL.py", "label": "Merge clips 1080P (AUTO)", "interactive": False},
         {"script": "07_BAHS_add-music-overlay-ALL.py", "label": "Add music overlay (AUTO)", "interactive": False},
-        {"script": "08_BAHS_add-text-overlay-ALL.py", "label": "Add text overlay 1080P (AUTO)", "interactive": False},
-        {"script": "10_BAHS_add-logo-overlay-ALL.py", "label": "Add logo overlay 1080P (AUTO)", "interactive": False},
+        {"script": "11_BAHS_add-text-logo-overlay-ALL.py", "label": "Add text & logo overlay 1080P (AUTO)", "interactive": False},
     ])
     for idx, s in enumerate(raw_steps, start=1):
         s["step"] = idx

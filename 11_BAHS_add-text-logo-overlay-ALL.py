@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 
-SCRIPT_NAME = "08_BAHS_add-text-overlay-ALL"
+SCRIPT_NAME = "11_BAHS_add-text-logo-overlay-ALL"
 FONT_EXTS = (".ttf",)
 LOGO_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 
@@ -119,7 +119,14 @@ def is_non_highlights_mode(tipo_raw: str) -> bool:
     return tipo_raw.strip().upper() != "HIGHLIGHTS"
 
 
-def build_stage_name(tipo_slug: str, fmt_slug: str, fade: bool = True, music: bool = False, text: bool = False, logo: bool = False) -> str:
+def build_stage_name(
+    tipo_slug: str,
+    fmt_slug: str,
+    fade: bool = True,
+    music: bool = False,
+    text: bool = False,
+    logo: bool = False,
+) -> str:
     parts = [tipo_slug, fmt_slug, "with", "fade" if fade else "nofade"]
     if music:
         parts.append("music")
@@ -138,7 +145,6 @@ def parse_video_flags(video_path: Path) -> tuple[bool, bool]:
 
 
 def escape_drawtext(text: str) -> str:
-    """Effettua l'escape dei caratteri speciali per il filtro drawtext di FFmpeg."""
     escaped = text.replace("\\", "\\\\")
     escaped = escaped.replace(":", "\\:")
     escaped = escaped.replace("'", "’")
@@ -177,8 +183,7 @@ def setup_dirs_and_logger(base_dir: Path) -> tuple[dict[str, Path], logging.Logg
     return dirs, logger, log_file
 
 
-def probe_video_info(video_path: Path) -> dict:
-    """Estrae durata, risoluzione, pixel format, SAR e informazioni audio con un solo ffprobe."""
+def probe_media_dimensions(media_path: Path, is_video: bool = True) -> dict:
     info = {
         "duration_ms": 0,
         "width": 0,
@@ -188,13 +193,12 @@ def probe_video_info(video_path: Path) -> dict:
         "has_audio": False,
         "audio_codec": "",
     }
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration:stream=codec_type,codec_name,width,height,pix_fmt,sample_aspect_ratio",
-        "-of", "json",
-        str(video_path),
-    ]
+    entries = (
+        "format=duration:stream=codec_type,codec_name,width,height,pix_fmt,sample_aspect_ratio"
+        if is_video
+        else "stream=codec_type,width,height"
+    )
+    cmd = ["ffprobe", "-v", "error", "-show_entries", entries, "-of", "json", str(media_path)]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if res.returncode != 0 or not res.stdout.strip():
         return info
@@ -204,11 +208,12 @@ def probe_video_info(video_path: Path) -> dict:
     except json.JSONDecodeError:
         return info
 
-    fmt = data.get("format") or {}
-    try:
-        info["duration_ms"] = max(0, int(round(float(fmt.get("duration", 0)) * 1000.0)))
-    except (TypeError, ValueError):
-        info["duration_ms"] = 0
+    if is_video:
+        fmt = data.get("format") or {}
+        try:
+            info["duration_ms"] = max(0, int(round(float(fmt.get("duration", 0)) * 1000.0)))
+        except (TypeError, ValueError):
+            info["duration_ms"] = 0
 
     for stream in data.get("streams") or []:
         ctype = stream.get("codec_type")
@@ -224,30 +229,24 @@ def probe_video_info(video_path: Path) -> dict:
     return info
 
 
-def get_logo_dimensions(extra_dir: Path, target_w: int) -> tuple[int, int]:
-    """Restituisce (larghezza, altezza) scalate del logo in EXTRA/logo.* per il formato indicato."""
-    if extra_dir.is_dir():
-        for entry in sorted(extra_dir.iterdir()):
-            if entry.is_file() and entry.stem.lower() == "logo" and entry.suffix.lower() in LOGO_EXTS:
-                cmd = [
-                    "ffprobe",
-                    "-v", "error",
-                    "-select_streams", "v:0",
-                    "-show_entries", "stream=width,height",
-                    "-of", "csv=p=0:s=x",
-                    str(entry),
-                ]
-                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                parts = res.stdout.strip().split("x")
-                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                    orig_w, orig_h = int(parts[0]), int(parts[1])
-                    if orig_w > 0 and orig_h > 0:
-                        scaled_h = max(2, int(round((orig_h * target_w) / orig_w)))
-                        if scaled_h % 2 != 0:
-                            scaled_h += 1
-                        return target_w, scaled_h
+def get_scaled_logo_height(logo_path: Path, target_w: int) -> int:
+    meta = probe_media_dimensions(logo_path, is_video=False)
+    orig_w, orig_h = meta["width"], meta["height"]
+    if orig_w > 0 and orig_h > 0:
+        scaled_h = max(2, int(round((orig_h * target_w) / orig_w)))
+        if scaled_h % 2 != 0:
+            scaled_h += 1
+        return scaled_h
+    return target_w
 
-    return target_w, target_w
+
+def is_video_already_normalized(vid_info: dict, target_w: int, target_h: int) -> bool:
+    return (
+        vid_info["width"] == target_w
+        and vid_info["height"] == target_h
+        and vid_info["pix_fmt"] == "yuv420p"
+        and vid_info["sar"] in ("", "0:1", "1:1")
+    )
 
 
 def parse_progress_ms(line: str) -> int | None:
@@ -267,7 +266,6 @@ def parse_progress_ms(line: str) -> int | None:
 
 
 def attendi_font_in_cartella_extra(extra_dir: Path, logger: logging.Logger, required: bool = True) -> Path | None:
-    """Controlla 'EXTRA/' per font.ttf (o altro .ttf); se richiesto e assente, avvisa e riavvia lo script."""
     while True:
         preferred_font = extra_dir / "font.ttf"
         if preferred_font.is_file() and preferred_font.stat().st_size > 0:
@@ -290,6 +288,37 @@ def attendi_font_in_cartella_extra(extra_dir: Path, logger: logging.Logger, requ
         if sc in ("0", "q", "quit", "exit"):
             print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
             logger.info(f"[{SCRIPT_NAME}] Uscita richiesta dall'utente per mancanza font in EXTRA/.")
+            sys.exit(1)
+
+        script_file = str(Path(__file__).resolve())
+        os.execv(sys.executable, [sys.executable, script_file] + sys.argv[1:])
+
+
+def find_logo(extra_dir: Path) -> Path | None:
+    logos = sorted([
+        p for p in extra_dir.iterdir()
+        if p.is_file() and p.stem.lower() == "logo" and p.suffix.lower() in LOGO_EXTS and p.stat().st_size > 0
+    ])
+    return logos[0] if logos else None
+
+
+def attendi_logo_in_cartella_extra(extra_dir: Path, logger: logging.Logger) -> Path:
+    avvisato_log = False
+    while True:
+        logo_path = find_logo(extra_dir)
+        if logo_path:
+            return logo_path
+
+        if not avvisato_log:
+            logger.warning(f"[{SCRIPT_NAME}] Nessun file 'logo.*' trovato in 'EXTRA/' ({', '.join(LOGO_EXTS)}).")
+            avvisato_log = True
+
+        print(f"\n{RED}{BOLD}[X] [{SCRIPT_NAME}] Nessun file 'logo.*' trovato nella cartella 'EXTRA/' ({', '.join(LOGO_EXTS)}).{RESET}", file=sys.stderr)
+        print(f"{YELLOW}[!] Inserisci un file 'logo.*' nella cartella 'EXTRA/' prima di proseguire.{RESET}")
+        sc = input("\n👉 Premi [INVIO] per riavviare lo script (oppure '0' per uscire): ").strip().lower()
+        if sc in ("0", "q", "quit", "exit"):
+            print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
+            logger.info(f"[{SCRIPT_NAME}] Uscita richiesta dall'utente per mancanza logo in EXTRA/.")
             sys.exit(1)
 
         script_file = str(Path(__file__).resolve())
@@ -322,7 +351,15 @@ def gestione_file_esistente(out_file: Path, auto: bool, logger: logging.Logger) 
         print(f"{RED}[!] Scelta non valida.{RESET}")
 
 
-def select_input_video(out_dir: Path, final_dir: Path, tmp_dir: Path, tipo_raw: str, tipo_slug: str, fmt_slug: str, auto: bool) -> Path | None:
+def select_input_video(
+    out_dir: Path,
+    final_dir: Path,
+    tmp_dir: Path,
+    tipo_raw: str,
+    tipo_slug: str,
+    fmt_slug: str,
+    auto: bool,
+) -> Path | None:
     candidates = [
         tmp_dir / build_stage_name(tipo_slug, fmt_slug, fade=True, music=True),
         final_dir / build_stage_name(tipo_slug, fmt_slug, fade=True, music=True),
@@ -360,15 +397,6 @@ def select_input_video(out_dir: Path, final_dir: Path, tmp_dir: Path, tipo_raw: 
         print(f"{RED}[!] Scelta non valida.{RESET}")
 
 
-def is_video_already_normalized(vid_info: dict, target_w: int, target_h: int) -> bool:
-    return (
-        vid_info["width"] == target_w
-        and vid_info["height"] == target_h
-        and vid_info["pix_fmt"] == "yuv420p"
-        and vid_info["sar"] in ("", "0:1", "1:1")
-    )
-
-
 def append_audio_output_args(cmd: list[str], vid_info: dict):
     if not vid_info["has_audio"]:
         return
@@ -378,11 +406,12 @@ def append_audio_output_args(cmd: list[str], vid_info: dict):
         cmd.extend(["-map", "0:a?", "-c:a", "aac", "-b:a", "192k"])
 
 
-def build_cmd_1080p(
+def build_combined_cmd(
+    fmt_slug: str,
     in_video: Path,
+    logo_path: Path,
     tmp_out_file: Path,
     tmp_font: Path | None,
-    extra_dir: Path,
     top_text: str,
     dynamic_text: str,
     duration_sec: float,
@@ -397,27 +426,52 @@ def build_cmd_1080p(
     safe_top_text = escape_drawtext(top_text)
     safe_dynamic_text = escape_drawtext(dynamic_text)
 
-    _, logo_scaled_h = get_logo_dimensions(extra_dir, FHD_LOGO_WIDTH)
-    logo_top_y = FHD_HEIGHT - FHD_LOGO_MARGIN_Y - logo_scaled_h
-    logo_center_y = int(round(logo_top_y + (logo_scaled_h / 2.0)))
-
-    base_x = 60
-    line_height = 4
-    line_y = logo_center_y - (line_height // 2)
-    base_y = line_y - 72
-    dynamic_y = line_y + 24
-    line_width = 750
-
-    trans_time = min(1.5, duration_sec / 3.0)
-    start_x = -1600
-    target_x = base_x
+    trans_time = min(1.5 if fmt_slug == "1080P" else 1.2, duration_sec / 3.0)
     hold_end = max(trans_time, duration_sec - trans_time)
 
-    skip_scale = is_video_already_normalized(vid_info, FHD_WIDTH, FHD_HEIGHT)
+    if fmt_slug == "REEL":
+        tw, th = REEL_WIDTH, REEL_HEIGHT
+        lw = REEL_LOGO_WIDTH if REEL_LOGO_WIDTH % 2 == 0 else REEL_LOGO_WIDTH + 1
+        mx, my = REEL_LOGO_MARGIN_X, REEL_LOGO_MARGIN_Y
+        base_x = 48
+        line_height = 5
+        line_y = 1380
+        base_y = line_y - 70
+        dynamic_y = line_y + 22
+        line_width = 720
+        start_x = -1120
+        top_fontsize = 56
+        sub_fontsize = 44
+        border_color = "black@0.85"
+        pad_extra = ":color=black,setsar=1"
+        extra_mux_args = ["-movflags", "+faststart"]
+    else:
+        tw, th = FHD_WIDTH, FHD_HEIGHT
+        lw = FHD_LOGO_WIDTH if FHD_LOGO_WIDTH % 2 == 0 else FHD_LOGO_WIDTH + 1
+        mx, my = FHD_LOGO_MARGIN_X, FHD_LOGO_MARGIN_Y
+        logo_scaled_h = get_scaled_logo_height(logo_path, lw)
+        logo_top_y = FHD_HEIGHT - FHD_LOGO_MARGIN_Y - logo_scaled_h
+        logo_center_y = int(round(logo_top_y + (logo_scaled_h / 2.0)))
+        base_x = 60
+        line_height = 4
+        line_y = logo_center_y - (line_height // 2)
+        base_y = line_y - 72
+        dynamic_y = line_y + 24
+        line_width = 750
+        start_x = -1600
+        top_fontsize = 64
+        sub_fontsize = 64
+        border_color = "black"
+        pad_extra = ""
+        extra_mux_args = []
+
+    target_x = base_x
+    skip_scale = is_video_already_normalized(vid_info, tw, th)
+
     logger.info(
-        f"[{SCRIPT_NAME}] Layout testo 1080P: logo_center_y={logo_center_y}, line_y={line_y}, "
-        f"base_y={base_y}, dynamic_y={dynamic_y} | skip_scale={skip_scale} | "
-        f"audio_codec='{vid_info['audio_codec']}' | end_sec={duration_sec}"
+        f"[{SCRIPT_NAME}] Singolo passaggio {fmt_slug} | skip_scale={skip_scale} | "
+        f"line_y={line_y}, base_y={base_y}, dynamic_y={dynamic_y} | "
+        f"logo_size={lw}px, margin=({mx},{my}) | audio_codec='{vid_info['audio_codec']}' | end_sec={duration_sec}"
     )
 
     x_expr = (
@@ -438,28 +492,32 @@ def build_cmd_1080p(
         norm_stage = "[0:v]null[v_norm];"
     else:
         norm_stage = (
-            f"[0:v]scale={FHD_WIDTH}:{FHD_HEIGHT}:force_original_aspect_ratio=decrease,"
-            f"pad={FHD_WIDTH}:{FHD_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v_norm];"
+            f"[0:v]scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+            f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2{pad_extra},format=yuv420p[v_norm];"
         )
 
     filter_complex = (
         f"{norm_stage}"
         f"[v_norm]drawtext={font_clause}text='{safe_top_text}':"
-        f"fontcolor=white:fontsize=64:borderw=3:bordercolor=black:"
+        f"fontcolor=white:fontsize={top_fontsize}:borderw=3:bordercolor={border_color}:"
         f"x={base_x}:y={base_y}:alpha='{alpha_expr}':"
         f"enable='between(t,0,{duration_sec})'[txt_top];"
         f"[txt_top]drawbox=x={base_x}:y={line_y}:w={line_width}:h={line_height}:color=0x00FF66:t=fill:"
         f"enable='between(t,0,{duration_sec})'[line_green];"
         f"[line_green]drawtext={font_clause}text='{safe_dynamic_text}':"
-        f"fontcolor=white:fontsize=64:borderw=3:bordercolor=black:"
+        f"fontcolor=white:fontsize={sub_fontsize}:borderw=3:bordercolor={border_color}:"
         f"x='{x_expr}':y={dynamic_y}:alpha='{alpha_expr}':"
-        f"enable='between(t,0,{duration_sec})'[v_final]"
+        f"enable='between(t,0,{duration_sec})'[v_text];"
+        f"[1:v]scale={lw}:-2:flags=lanczos,format=rgba,colorchannelmixer=aa=0.75[logo_s];"
+        f"[v_text][logo_s]overlay=x=W-w-{mx}:y=H-h-{my}:format=auto:shortest=1[v_final]"
     )
 
     cmd = [
         "ffmpeg",
         "-loglevel", "error",
         "-i", str(in_video),
+        "-loop", "1",
+        "-i", str(logo_path),
         "-filter_complex", filter_complex,
         "-map", "[v_final]",
     ]
@@ -469,103 +527,7 @@ def build_cmd_1080p(
         "-preset", res["preset"],
         "-crf", "18",
         "-pix_fmt", "yuv420p",
-        "-threads", str(res["threads"]),
-        "-progress", "pipe:1",
-        "-nostats",
-        "-y",
-        str(tmp_out_file),
-    ])
-    return cmd
-
-
-def build_cmd_reel(
-    in_video: Path,
-    tmp_out_file: Path,
-    tmp_font: Path | None,
-    top_text: str,
-    dynamic_text: str,
-    duration: float,
-    vid_info: dict,
-    res: dict,
-    logger: logging.Logger,
-) -> list[str]:
-    font_clause = ""
-    if tmp_font and tmp_font.is_file():
-        font_clause = f"fontfile='{escape_drawtext_fontfile(tmp_font)}':"
-
-    safe_top_text = escape_drawtext(top_text)
-    safe_dynamic_text = escape_drawtext(dynamic_text)
-
-    base_x = 48
-    line_height = 5
-    line_y = 1380
-    base_y = line_y - 70
-    dynamic_y = line_y + 22
-    line_width = 720
-
-    trans_time = min(1.2, duration / 3.0)
-    start_x = -1120
-    target_x = base_x
-    hold_end = max(trans_time, duration - trans_time)
-
-    skip_scale = is_video_already_normalized(vid_info, REEL_WIDTH, REEL_HEIGHT)
-    logger.info(
-        f"[{SCRIPT_NAME}] Layout testo REEL (durata {duration}s): "
-        f"line_y={line_y}, base_y={base_y}, dynamic_y={dynamic_y}, line_width={line_width} | "
-        f"skip_scale={skip_scale} | audio_codec='{vid_info['audio_codec']}' | end_sec={duration}"
-    )
-
-    x_expr = (
-        f"if(lt(t\\,{trans_time})\\,"
-        f"{start_x}+({target_x}-({start_x}))*sin((t/{trans_time})*1.570796)\\,"
-        f"if(lt(t\\,{hold_end})\\,"
-        f"{target_x}\\,"
-        f"{target_x}+({start_x}-{target_x})*sin(((t-{hold_end})/{trans_time})*1.570796)))"
-    )
-
-    alpha_expr = (
-        f"if(lt(t\\,{trans_time})\\,t/{trans_time}\\,"
-        f"if(lt(t\\,{hold_end})\\,1\\,"
-        f"({duration}-t)/{trans_time}))"
-    )
-
-    if skip_scale:
-        norm_stage = "[0:v]null[v_norm];"
-    else:
-        norm_stage = (
-            f"[0:v]scale={REEL_WIDTH}:{REEL_HEIGHT}:force_original_aspect_ratio=decrease,"
-            f"pad={REEL_WIDTH}:{REEL_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
-            f"setsar=1,format=yuv420p[v_norm];"
-        )
-
-    filter_complex = (
-        f"{norm_stage}"
-        f"[v_norm]drawtext={font_clause}text='{safe_top_text}':"
-        f"fontcolor=white:fontsize=56:borderw=3:bordercolor=black@0.85:"
-        f"x={base_x}:y={base_y}:alpha='{alpha_expr}':"
-        f"enable='between(t,0,{duration})'[txt_top];"
-        f"[txt_top]drawbox=x={base_x}:y={line_y}:w={line_width}:h={line_height}:color=0x00FF66:t=fill:"
-        f"enable='between(t,0,{duration})'[line_green];"
-        f"[line_green]drawtext={font_clause}text='{safe_dynamic_text}':"
-        f"fontcolor=white:fontsize=44:borderw=3:bordercolor=black@0.85:"
-        f"x='{x_expr}':y={dynamic_y}:alpha='{alpha_expr}':"
-        f"enable='between(t,0,{duration})'[v_final]"
-    )
-
-    cmd = [
-        "ffmpeg",
-        "-loglevel", "error",
-        "-i", str(in_video),
-        "-filter_complex", filter_complex,
-        "-map", "[v_final]",
-    ]
-    append_audio_output_args(cmd, vid_info)
-    cmd.extend([
-        "-c:v", "libx264",
-        "-preset", res["preset"],
-        "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
+        *extra_mux_args,
         "-threads", str(res["threads"]),
         "-progress", "pipe:1",
         "-nostats",
@@ -578,7 +540,7 @@ def build_cmd_reel(
 def main():
     abilita_ansi()
 
-    parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Sovraimpressione testo 1080P o REEL")
+    parser = argparse.ArgumentParser(description=f"{SCRIPT_NAME} - Sovraimpressione testo e logo in singolo passaggio")
     parser.add_argument("--base-dir", default=".")
     parser.add_argument("--tipo", default=DEFAULT_TOP_TEXT)
     parser.add_argument("--sottotitolo", default=DEFAULT_SUB_TEXT)
@@ -610,10 +572,8 @@ def main():
         sys.exit(1)
 
     font_path = attendi_font_in_cartella_extra(dirs["extra"], logger, required=(fmt_slug == "1080P"))
-    if font_path:
-        logger.info(f"[{SCRIPT_NAME}] Utilizzo font: '{font_path}'")
-    else:
-        logger.info(f"[{SCRIPT_NAME}] Nessun font custom trovato (opzionale per {fmt_slug}): uso font di default FFmpeg.")
+    logo_path = attendi_logo_in_cartella_extra(dirs["extra"], logger)
+    logger.info(f"[{SCRIPT_NAME}] Font='{font_path or 'default'}' | Logo='{logo_path}'")
 
     in_video = select_input_video(dirs["out"], dirs["final"], dirs["tmp"], args.tipo, tipo_slug, fmt_slug, args.auto)
     if not in_video or not in_video.is_file():
@@ -622,7 +582,7 @@ def main():
         sys.exit(1)
 
     fade_flag, has_music_flag = parse_video_flags(in_video)
-    stage_name = build_stage_name(tipo_slug, fmt_slug, fade=fade_flag, music=has_music_flag, text=True)
+    stage_name = build_stage_name(tipo_slug, fmt_slug, fade=fade_flag, music=has_music_flag, text=True, logo=True)
     out_file = dirs["final"] / stage_name
     tmp_out_file = dirs["tmp"] / f"{Path(stage_name).stem}_{pid}.part.mp4"
 
@@ -653,26 +613,25 @@ def main():
         shutil.copy2(font_path, tmp_font)
         logger.info(f"[{SCRIPT_NAME}] Copiato '{font_path.name}' in TMP come '{tmp_font.name}'.")
 
-    vid_info = probe_video_info(in_video)
+    vid_info = probe_media_dimensions(in_video, is_video=True)
     total_ms = vid_info["duration_ms"]
     overlay_end_sec = float(args.duration) if args.duration and args.duration > 0 else TEXT_DISPLAY_DURATION_SEC
 
-    if fmt_slug == "REEL":
-        cmd = build_cmd_reel(
-            in_video, tmp_out_file, tmp_font,
-            top_text, dynamic_text, overlay_end_sec, vid_info, res, logger
-        )
-        bar_desc = "08 | Overlay Testo REEL"
-        bar_col = "cyan"
-    else:
-        cmd = build_cmd_1080p(
-            in_video, tmp_out_file, tmp_font, dirs["extra"],
-            top_text, dynamic_text, overlay_end_sec, vid_info, res, logger
-        )
-        bar_desc = "08 | Overlay Testo 1080P"
-        bar_col = "green"
-
-    logger.info(f"[{SCRIPT_NAME}] Esecuzione FFmpeg (durata_video_ms={total_ms}): {cmd}")
+    cmd = build_combined_cmd(
+        fmt_slug=fmt_slug,
+        in_video=in_video,
+        logo_path=logo_path,
+        tmp_out_file=tmp_out_file,
+        tmp_font=tmp_font,
+        top_text=top_text,
+        dynamic_text=dynamic_text,
+        duration_sec=overlay_end_sec,
+        vid_info=vid_info,
+        res=res,
+        logger=logger,
+    )
+    bar_col = "cyan" if fmt_slug == "REEL" else "green"
+    logger.info(f"[{SCRIPT_NAME}] Esecuzione FFmpeg singolo passaggio (durata_video_ms={total_ms}): {cmd}")
 
     stderr_lines: list[str] = []
 
@@ -694,7 +653,7 @@ def main():
             t_err.start()
 
         last_ms = 0
-        with tqdm(total=max(1, total_ms), desc=bar_desc, unit="ms", unit_scale=True, colour=bar_col, ncols=78) as bar:
+        with tqdm(total=max(1, total_ms), desc=f"11 | Testo+Logo {fmt_slug}", unit="ms", unit_scale=True, colour=bar_col, ncols=78) as bar:
             if proc.stdout:
                 for raw in iter(proc.stdout.readline, ""):
                     line = raw.strip()
@@ -713,7 +672,7 @@ def main():
 
         if rc != 0 or not tmp_out_file.is_file() or tmp_out_file.stat().st_size == 0:
             err_msg = " ".join(stderr_lines[-8:]) or f"returncode={rc}"
-            print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore durante l'aggiunta del testo ({fmt_slug}) con FFmpeg (log: {log_file.name}).{RESET}", file=sys.stderr)
+            print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore durante overlay testo+logo ({fmt_slug}) con FFmpeg (log: {log_file.name}).{RESET}", file=sys.stderr)
             logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg (rc={rc}): {err_msg}")
             sys.exit(1)
 
