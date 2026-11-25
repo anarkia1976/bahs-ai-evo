@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import ctypes
 import shutil
 import logging
@@ -12,8 +13,18 @@ from tqdm import tqdm
 
 SCRIPT_NAME = "10_BAHS_add-logo-overlay-ALL"
 LOGO_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+
+# Formato 1080P (1920x1080)
 VIDEO_1080P_W, VIDEO_1080P_H = 1920, 1080
+FHD_LOGO_WIDTH = 125
+FHD_LOGO_MARGIN_X = 40
+FHD_LOGO_MARGIN_Y = 36
+
+# Formato REEL (1080x1920 verticale 9:16)
 REEL_W, REEL_H = 1080, 1920
+REEL_LOGO_WIDTH = 98
+REEL_LOGO_MARGIN_X = 36
+REEL_LOGO_MARGIN_Y = 48
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -146,30 +157,60 @@ def setup_dirs_and_logger(base_dir: Path) -> tuple[dict[str, Path], logging.Logg
     return dirs, logger, log_file
 
 
-def get_duration_ms(video_path: Path) -> int:
+def probe_video_info(video_path: Path) -> dict:
+    """Estrae durata, risoluzione, pixel format, SAR e informazioni audio con un solo ffprobe."""
+    info = {
+        "duration_ms": 0,
+        "width": 0,
+        "height": 0,
+        "pix_fmt": "",
+        "sar": "",
+        "has_audio": False,
+        "audio_codec": "",
+    }
     cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration:stream=codec_type,codec_name,width,height,pix_fmt,sample_aspect_ratio",
+        "-of", "json",
         str(video_path),
     ]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0 or not res.stdout.strip():
+        return info
+
     try:
-        return max(0, int(round(float(res.stdout.strip()) * 1000.0)))
-    except ValueError:
-        return 0
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return info
+
+    fmt = data.get("format") or {}
+    try:
+        info["duration_ms"] = max(0, int(round(float(fmt.get("duration", 0)) * 1000.0)))
+    except (TypeError, ValueError):
+        info["duration_ms"] = 0
+
+    for stream in data.get("streams") or []:
+        ctype = stream.get("codec_type")
+        if ctype == "video" and info["width"] == 0:
+            info["width"] = int(stream.get("width") or 0)
+            info["height"] = int(stream.get("height") or 0)
+            info["pix_fmt"] = str(stream.get("pix_fmt") or "")
+            info["sar"] = str(stream.get("sample_aspect_ratio") or "")
+        elif ctype == "audio" and not info["has_audio"]:
+            info["has_audio"] = True
+            info["audio_codec"] = str(stream.get("codec_name") or "").lower()
+
+    return info
 
 
-def has_audio(video_path: Path) -> bool:
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "a",
-        "-show_entries", "stream=index",
-        "-of", "csv=p=0",
-        str(video_path),
-    ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return bool(res.stdout.strip())
+def is_video_already_normalized(vid_info: dict, target_w: int, target_h: int) -> bool:
+    return (
+        vid_info["width"] == target_w
+        and vid_info["height"] == target_h
+        and vid_info["pix_fmt"] == "yuv420p"
+        and vid_info["sar"] in ("", "0:1", "1:1")
+    )
 
 
 def parse_progress_ms(line: str) -> int | None:
@@ -265,6 +306,7 @@ def main():
         fmt_slug = "1080P"
 
     tipo_slug = sanitize_slug(args.tipo)
+    pid = os.getpid()
 
     logger.info(
         f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | formato='{fmt_slug}' | "
@@ -293,10 +335,8 @@ def main():
             dirs["final"] / build_stage_name(tipo_slug, "REEL", fade=True, music=False, text=False),
         ]
         tw, th = REEL_W, REEL_H
-        lw = int(round(tw * 0.09))
-        if lw % 2 != 0:
-            lw += 1
-        mx, my = 36, 48
+        lw = REEL_LOGO_WIDTH if REEL_LOGO_WIDTH % 2 == 0 else REEL_LOGO_WIDTH + 1
+        mx, my = REEL_LOGO_MARGIN_X, REEL_LOGO_MARGIN_Y
         bar_col = "cyan"
     else:
         preferred = [
@@ -312,10 +352,8 @@ def main():
             dirs["final"] / build_stage_name(tipo_slug, "1080P", fade=True, music=False, text=False),
         ]
         tw, th = VIDEO_1080P_W, VIDEO_1080P_H
-        lw = int(round(tw * 0.065))
-        if lw % 2 != 0:
-            lw += 1
-        mx, my = 40, 36
+        lw = FHD_LOGO_WIDTH if FHD_LOGO_WIDTH % 2 == 0 else FHD_LOGO_WIDTH + 1
+        mx, my = FHD_LOGO_MARGIN_X, FHD_LOGO_MARGIN_Y
         bar_col = "green"
 
     if is_non_highlights_mode(args.tipo):
@@ -337,10 +375,14 @@ def main():
         logo=True,
     )
     out_file = dirs["final"] / stage_name
-    tmp_out_file = dirs["tmp"] / stage_name
+    tmp_out_file = dirs["tmp"] / f"{Path(stage_name).stem}_{pid}.part.mp4"
+
+    vid_info = probe_video_info(in_video)
+    skip_scale = is_video_already_normalized(vid_info, tw, th)
 
     logger.info(
         f"[{SCRIPT_NAME}] Video input='{in_video}' | layers=(fade={fade_flag}, music={has_music_flag}, text={has_text_flag}) | "
+        f"skip_scale={skip_scale} | audio_codec='{vid_info['audio_codec']}' | "
         f"logo_size={lw}px | margin=({mx},{my}) | out_file='{out_file}'"
     )
 
@@ -352,14 +394,21 @@ def main():
         logger.info(f"[{SCRIPT_NAME}] Completato (SKIP): mantenuto '{out_file}'.")
         return
 
+    if skip_scale:
+        base_stage = "[0:v]null[v_base];"
+    else:
+        base_stage = (
+            f"[0:v]scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+            f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p[v_base];"
+        )
+
     fc = (
-        f"[0:v]scale={tw}:{th}:force_original_aspect_ratio=decrease,"
-        f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p[v_base];"
-        f"[1:v]format=rgba,colorchannelmixer=aa=0.75,scale={lw}:-2:flags=lanczos[logo_s];"
+        f"{base_stage}"
+        f"[1:v]scale={lw}:-2:flags=lanczos,format=rgba,colorchannelmixer=aa=0.75[logo_s];"
         f"[v_base][logo_s]overlay=x=W-w-{mx}:y=H-h-{my}:format=auto[v_out]"
     )
 
-    total_ms = get_duration_ms(in_video)
+    total_ms = vid_info["duration_ms"]
     cmd = [
         "ffmpeg",
         "-loglevel", "error",
@@ -368,8 +417,11 @@ def main():
         "-filter_complex", fc,
         "-map", "[v_out]",
     ]
-    if has_audio(in_video):
-        cmd.extend(["-map", "0:a?", "-c:a", "aac", "-b:a", "192k"])
+    if vid_info["has_audio"]:
+        if vid_info["audio_codec"] == "aac":
+            cmd.extend(["-map", "0:a?", "-c:a", "copy"])
+        else:
+            cmd.extend(["-map", "0:a?", "-c:a", "aac", "-b:a", "192k"])
     cmd.extend([
         "-c:v", "libx264",
         "-preset", res["preset"],
@@ -427,7 +479,7 @@ def main():
             logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg (rc={rc}): {err_msg}")
             sys.exit(1)
 
-        shutil.move(str(tmp_out_file), str(out_file))
+        os.replace(tmp_out_file, out_file)
         size_mb = out_file.stat().st_size / (1024 * 1024)
         logger.info(f"[{SCRIPT_NAME}] Completato con successo: '{out_file}' ({size_mb:.2f} MB)")
     finally:

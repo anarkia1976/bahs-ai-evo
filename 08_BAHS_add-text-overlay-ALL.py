@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import ctypes
 import shutil
 import logging
@@ -176,30 +177,51 @@ def setup_dirs_and_logger(base_dir: Path) -> tuple[dict[str, Path], logging.Logg
     return dirs, logger, log_file
 
 
-def get_duration_ms(video_path: Path) -> int:
+def probe_video_info(video_path: Path) -> dict:
+    """Estrae durata, risoluzione, pixel format, SAR e informazioni audio con un solo ffprobe."""
+    info = {
+        "duration_ms": 0,
+        "width": 0,
+        "height": 0,
+        "pix_fmt": "",
+        "sar": "",
+        "has_audio": False,
+        "audio_codec": "",
+    }
     cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration:stream=codec_type,codec_name,width,height,pix_fmt,sample_aspect_ratio",
+        "-of", "json",
         str(video_path),
     ]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0 or not res.stdout.strip():
+        return info
+
     try:
-        return max(0, int(round(float(res.stdout.strip()) * 1000.0)))
-    except ValueError:
-        return 0
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return info
 
+    fmt = data.get("format") or {}
+    try:
+        info["duration_ms"] = max(0, int(round(float(fmt.get("duration", 0)) * 1000.0)))
+    except (TypeError, ValueError):
+        info["duration_ms"] = 0
 
-def has_audio(video_path: Path) -> bool:
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "a",
-        "-show_entries", "stream=index",
-        "-of", "csv=p=0",
-        str(video_path),
-    ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return bool(res.stdout.strip())
+    for stream in data.get("streams") or []:
+        ctype = stream.get("codec_type")
+        if ctype == "video" and info["width"] == 0:
+            info["width"] = int(stream.get("width") or 0)
+            info["height"] = int(stream.get("height") or 0)
+            info["pix_fmt"] = str(stream.get("pix_fmt") or "")
+            info["sar"] = str(stream.get("sample_aspect_ratio") or "")
+        elif ctype == "audio" and not info["has_audio"]:
+            info["has_audio"] = True
+            info["audio_codec"] = str(stream.get("codec_name") or "").lower()
+
+    return info
 
 
 def get_logo_dimensions(extra_dir: Path, target_w: int) -> tuple[int, int]:
@@ -338,6 +360,24 @@ def select_input_video(out_dir: Path, final_dir: Path, tmp_dir: Path, tipo_raw: 
         print(f"{RED}[!] Scelta non valida.{RESET}")
 
 
+def is_video_already_normalized(vid_info: dict, target_w: int, target_h: int) -> bool:
+    return (
+        vid_info["width"] == target_w
+        and vid_info["height"] == target_h
+        and vid_info["pix_fmt"] == "yuv420p"
+        and vid_info["sar"] in ("", "0:1", "1:1")
+    )
+
+
+def append_audio_output_args(cmd: list[str], vid_info: dict):
+    if not vid_info["has_audio"]:
+        return
+    if vid_info["audio_codec"] == "aac":
+        cmd.extend(["-map", "0:a?", "-c:a", "copy"])
+    else:
+        cmd.extend(["-map", "0:a?", "-c:a", "aac", "-b:a", "192k"])
+
+
 def build_cmd_1080p(
     in_video: Path,
     tmp_out_file: Path,
@@ -346,6 +386,7 @@ def build_cmd_1080p(
     top_text: str,
     dynamic_text: str,
     duration_sec: float,
+    vid_info: dict,
     res: dict,
     logger: logging.Logger,
 ) -> list[str]:
@@ -372,10 +413,11 @@ def build_cmd_1080p(
     target_x = base_x
     hold_end = max(trans_time, duration_sec - trans_time)
 
+    skip_scale = is_video_already_normalized(vid_info, FHD_WIDTH, FHD_HEIGHT)
     logger.info(
         f"[{SCRIPT_NAME}] Layout testo 1080P: logo_center_y={logo_center_y}, line_y={line_y}, "
-        f"base_y={base_y}, dynamic_y={dynamic_y} | top_text='{top_text}' | "
-        f"dynamic_text='{dynamic_text}' | end_sec={duration_sec}"
+        f"base_y={base_y}, dynamic_y={dynamic_y} | skip_scale={skip_scale} | "
+        f"audio_codec='{vid_info['audio_codec']}' | end_sec={duration_sec}"
     )
 
     x_expr = (
@@ -392,9 +434,16 @@ def build_cmd_1080p(
         f"({duration_sec}-t)/{trans_time}))"
     )
 
+    if skip_scale:
+        norm_stage = "[0:v]null[v_norm];"
+    else:
+        norm_stage = (
+            f"[0:v]scale={FHD_WIDTH}:{FHD_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={FHD_WIDTH}:{FHD_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v_norm];"
+        )
+
     filter_complex = (
-        f"[0:v]scale={FHD_WIDTH}:{FHD_HEIGHT}:force_original_aspect_ratio=decrease,"
-        f"pad={FHD_WIDTH}:{FHD_HEIGHT}:(ow-iw)/2:(oh-ih)/2,format=yuv420p[v_norm];"
+        f"{norm_stage}"
         f"[v_norm]drawtext={font_clause}text='{safe_top_text}':"
         f"fontcolor=white:fontsize=64:borderw=3:bordercolor=black:"
         f"x={base_x}:y={base_y}:alpha='{alpha_expr}':"
@@ -414,8 +463,7 @@ def build_cmd_1080p(
         "-filter_complex", filter_complex,
         "-map", "[v_final]",
     ]
-    if has_audio(in_video):
-        cmd.extend(["-map", "0:a?", "-c:a", "aac", "-b:a", "192k"])
+    append_audio_output_args(cmd, vid_info)
     cmd.extend([
         "-c:v", "libx264",
         "-preset", res["preset"],
@@ -434,10 +482,10 @@ def build_cmd_reel(
     in_video: Path,
     tmp_out_file: Path,
     tmp_font: Path | None,
-    extra_dir: Path,
     top_text: str,
     dynamic_text: str,
     duration: float,
+    vid_info: dict,
     res: dict,
     logger: logging.Logger,
 ) -> list[str]:
@@ -460,10 +508,11 @@ def build_cmd_reel(
     target_x = base_x
     hold_end = max(trans_time, duration - trans_time)
 
+    skip_scale = is_video_already_normalized(vid_info, REEL_WIDTH, REEL_HEIGHT)
     logger.info(
         f"[{SCRIPT_NAME}] Layout testo REEL (durata {duration}s): "
         f"line_y={line_y}, base_y={base_y}, dynamic_y={dynamic_y}, line_width={line_width} | "
-        f"top_text='{top_text}' | dynamic_text='{dynamic_text}' | end_sec={duration}"
+        f"skip_scale={skip_scale} | audio_codec='{vid_info['audio_codec']}' | end_sec={duration}"
     )
 
     x_expr = (
@@ -480,10 +529,17 @@ def build_cmd_reel(
         f"({duration}-t)/{trans_time}))"
     )
 
+    if skip_scale:
+        norm_stage = "[0:v]null[v_norm];"
+    else:
+        norm_stage = (
+            f"[0:v]scale={REEL_WIDTH}:{REEL_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={REEL_WIDTH}:{REEL_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"setsar=1,format=yuv420p[v_norm];"
+        )
+
     filter_complex = (
-        f"[0:v]scale={REEL_WIDTH}:{REEL_HEIGHT}:force_original_aspect_ratio=decrease,"
-        f"pad={REEL_WIDTH}:{REEL_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
-        f"setsar=1,format=yuv420p[v_norm];"
+        f"{norm_stage}"
         f"[v_norm]drawtext={font_clause}text='{safe_top_text}':"
         f"fontcolor=white:fontsize=56:borderw=3:bordercolor=black@0.85:"
         f"x={base_x}:y={base_y}:alpha='{alpha_expr}':"
@@ -503,8 +559,7 @@ def build_cmd_reel(
         "-filter_complex", filter_complex,
         "-map", "[v_final]",
     ]
-    if has_audio(in_video):
-        cmd.extend(["-map", "0:a?", "-c:a", "aac", "-b:a", "192k"])
+    append_audio_output_args(cmd, vid_info)
     cmd.extend([
         "-c:v", "libx264",
         "-preset", res["preset"],
@@ -541,6 +596,7 @@ def main():
         fmt_slug = "1080P"
 
     tipo_slug = sanitize_slug(args.tipo)
+    pid = os.getpid()
 
     logger.info(
         f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | "
@@ -568,7 +624,7 @@ def main():
     fade_flag, has_music_flag = parse_video_flags(in_video)
     stage_name = build_stage_name(tipo_slug, fmt_slug, fade=fade_flag, music=has_music_flag, text=True)
     out_file = dirs["final"] / stage_name
-    tmp_out_file = dirs["tmp"] / stage_name
+    tmp_out_file = dirs["tmp"] / f"{Path(stage_name).stem}_{pid}.part.mp4"
 
     logger.info(f"[{SCRIPT_NAME}] Video input='{in_video}' | fade={fade_flag} | music={has_music_flag} | out_file='{out_file}'")
 
@@ -593,24 +649,25 @@ def main():
 
     tmp_font: Path | None = None
     if font_path and font_path.is_file():
-        tmp_font = dirs["tmp"] / "font.ttf"
+        tmp_font = dirs["tmp"] / f"font_{pid}.ttf"
         shutil.copy2(font_path, tmp_font)
         logger.info(f"[{SCRIPT_NAME}] Copiato '{font_path.name}' in TMP come '{tmp_font.name}'.")
 
-    total_ms = get_duration_ms(in_video)
+    vid_info = probe_video_info(in_video)
+    total_ms = vid_info["duration_ms"]
     overlay_end_sec = float(args.duration) if args.duration and args.duration > 0 else TEXT_DISPLAY_DURATION_SEC
 
     if fmt_slug == "REEL":
         cmd = build_cmd_reel(
-            in_video, tmp_out_file, tmp_font, dirs["extra"],
-            top_text, dynamic_text, overlay_end_sec, res, logger
+            in_video, tmp_out_file, tmp_font,
+            top_text, dynamic_text, overlay_end_sec, vid_info, res, logger
         )
         bar_desc = "08 | Overlay Testo REEL"
         bar_col = "cyan"
     else:
         cmd = build_cmd_1080p(
             in_video, tmp_out_file, tmp_font, dirs["extra"],
-            top_text, dynamic_text, overlay_end_sec, res, logger
+            top_text, dynamic_text, overlay_end_sec, vid_info, res, logger
         )
         bar_desc = "08 | Overlay Testo 1080P"
         bar_col = "green"
@@ -660,7 +717,7 @@ def main():
             logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg (rc={rc}): {err_msg}")
             sys.exit(1)
 
-        shutil.move(str(tmp_out_file), str(out_file))
+        os.replace(tmp_out_file, out_file)
         size_mb = out_file.stat().st_size / (1024 * 1024)
         logger.info(f"[{SCRIPT_NAME}] Completato con successo: '{out_file}' ({size_mb:.2f} MB)")
     finally:
