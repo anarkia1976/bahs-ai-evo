@@ -7,6 +7,7 @@ import shutil
 import logging
 import argparse
 import warnings
+import threading
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -164,10 +165,7 @@ def rileva_gpu(requested_device: str, logger: logging.Logger) -> dict:
     if req == "cpu":
         selected_devices = ["cpu"]
     elif req == "auto":
-        if cuda_count > 0:
-            selected_devices = [f"cuda:{idx}" for idx in range(cuda_count)]
-        else:
-            selected_devices = ["cpu"]
+        selected_devices = [f"cuda:{idx}" for idx in range(cuda_count)] if cuda_count > 0 else ["cpu"]
     else:
         tokens = [tok for tok in req.split(",") if tok.strip()]
         parsed: list[str] = []
@@ -343,13 +341,7 @@ def prepare_model_path(model_arg: str, model_dir: Path, base_dir: Path, logger: 
             return target
 
     logger.info(f"[{SCRIPT_NAME}][YOLO-MODEL] Download modello '{model_filename}' in '{model_dir}'...")
-
-    prev_cwd = Path.cwd()
-    try:
-        os.chdir(model_dir)
-        YOLO(model_filename)
-    finally:
-        os.chdir(prev_cwd)
+    YOLO(str(target))
 
     for possible_dl in (model_dir / model_filename, base_dir / model_filename, Path.cwd() / model_filename):
         if possible_dl.is_file() and possible_dl.stat().st_size > 0 and possible_dl.resolve() != target.resolve():
@@ -400,6 +392,7 @@ def fill_gaps(centers_x: list[float | None], fallback_x: float, max_gap: int = 3
     if not known:
         return [fallback_x] * n
 
+    safe_gap = max(1, int(max_gap))
     out = [0.0] * n
     for k in known:
         out[k] = float(centers_x[k])  # type: ignore[arg-type]
@@ -410,7 +403,7 @@ def fill_gaps(centers_x: list[float | None], fallback_x: float, max_gap: int = 3
         prev_k = max([k for k in known if k < i], default=None)
         next_k = min([k for k in known if k > i], default=None)
 
-        if prev_k is not None and next_k is not None and (next_k - prev_k - 1) <= max_gap:
+        if prev_k is not None and next_k is not None and (next_k - prev_k - 1) <= safe_gap:
             r = (i - prev_k) / (next_k - prev_k)
             out[i] = (1.0 - r) * float(centers_x[prev_k]) + r * float(centers_x[next_k])  # type: ignore[index]
         elif prev_k is not None:
@@ -421,7 +414,7 @@ def fill_gaps(centers_x: list[float | None], fallback_x: float, max_gap: int = 3
                 vx = (float(centers_x[prev_k]) - float(centers_x[prev2_k])) / float(prev_k - prev2_k)  # type: ignore[index]
             damping = 0.85 ** min(dt, 15)
             extrap = float(centers_x[prev_k]) + vx * min(dt, 12) * damping  # type: ignore[index]
-            blend = min(1.0, dt / max(1, max_gap))
+            blend = min(1.0, dt / safe_gap)
             out[i] = (1.0 - blend) * extrap + blend * float(centers_x[prev_k])  # type: ignore[index]
         elif next_k is not None:
             out[i] = float(centers_x[next_k])  # type: ignore[index]
@@ -463,12 +456,6 @@ def smooth_camera_track(
     deadzone_ratio: float = 0.07,
     max_pan_widths_per_sec: float = 0.85,
 ) -> list[float]:
-    """
-    Rende il movimento della telecamera fluido e naturale:
-    1) Smoothing gaussiano bidirezionale calibrato sugli FPS.
-    2) Deadzone proporzionale alla larghezza del crop per evitare micro-oscillazioni.
-    3) Limite di velocità e accelerazione per transizioni progressive destra/sinistra.
-    """
     if not vals:
         return []
     if len(vals) == 1:
@@ -542,7 +529,7 @@ def predict_frame_with_fallback(
         if active_device.startswith("cuda"):
             _release_cuda_cache(active_device)
             logger.warning(
-                f"[{SCRIPT_NAME}][GPU-FALLBACK] Errore YOLO su '{active_device}' ({e}), "
+                f"[{SCRIPT_NAME}][GPU-FALLBACK] Erro YOLO su '{active_device}' ({e}), "
                 f"passo definitivamente a 'cpu'."
             )
             kwargs["device"] = "cpu"
@@ -550,13 +537,17 @@ def predict_frame_with_fallback(
         raise
 
 
-def build_ffmpeg_mux_cmd(
-    tmp_silent: Path,
+def build_ffmpeg_pipe_cmd(
     input_path: Path,
-    tmp_mux: Path,
+    tmp_out: Path,
+    fps: float,
+    out_w: int,
+    out_h: int,
     res: dict,
     encoder: str,
+    threads_override: int | None = None,
 ) -> list[str]:
+    ff_threads = str(threads_override or res["threads"])
     if encoder == "h264_nvenc":
         v_args = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20", "-pix_fmt", "yuv420p"]
     elif encoder == "h264_amf":
@@ -567,23 +558,104 @@ def build_ffmpeg_mux_cmd(
             "-preset", res["preset"],
             "-crf", "20",
             "-pix_fmt", "yuv420p",
-            "-threads", str(res["threads"]),
+            "-threads", ff_threads,
         ]
 
     return [
         "ffmpeg",
         "-loglevel", "error",
         "-y",
-        "-i", str(tmp_silent),
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{out_w}x{out_h}",
+        "-r", f"{fps:.6f}",
+        "-i", "-",
         "-i", str(input_path),
         "-map", "0:v:0",
         "-map", "1:a?",
         *v_args,
         "-c:a", "aac",
         "-b:a", "192k",
+        "-shortest",
         "-movflags", "+faststart",
-        str(tmp_mux),
+        str(tmp_out),
     ]
+
+
+def encode_cropped_video_direct(
+    input_path: Path,
+    tmp_out: Path,
+    smooth_x: list[float],
+    initial_x: float,
+    fps: float,
+    src_w: int,
+    crop_w: int,
+    crop_h: int,
+    out_w: int,
+    out_h: int,
+    res: dict,
+    encoder: str,
+    threads_override: int | None = None,
+) -> tuple[bool, str]:
+    half_w = crop_w / 2.0
+    cmd = build_ffmpeg_pipe_cmd(
+        input_path=input_path,
+        tmp_out=tmp_out,
+        fps=fps,
+        out_w=out_w,
+        out_h=out_h,
+        res=res,
+        encoder=encoder,
+        threads_override=threads_override,
+    )
+
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        return False, f"Impossibile riaprire {input_path.name} per il ritaglio REEL"
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    stderr_bytes = b""
+    idx = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            cx = smooth_x[idx] if idx < len(smooth_x) else initial_x
+            x1 = max(0, min(int(round(cx - half_w)), src_w - crop_w))
+            cropped = frame[0:crop_h, x1:x1 + crop_w]
+            resized = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+            if proc.stdin:
+                proc.stdin.write(resized.tobytes())
+            idx += 1
+    except BrokenPipeError:
+        pass
+    finally:
+        cap.release()
+        if proc.stdin:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+        if proc.stderr:
+            stderr_bytes = proc.stderr.read()
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+        rc = proc.wait()
+
+    if rc == 0 and tmp_out.is_file() and tmp_out.stat().st_size > 0:
+        return True, ""
+    err_msg = stderr_bytes.decode("utf-8", errors="replace").strip() or f"returncode={rc}"
+    return False, err_msg
 
 
 def convert_single_clip(
@@ -602,6 +674,7 @@ def convert_single_clip(
     assigned_device: str,
     ff_encoder: str,
     logger: logging.Logger,
+    threads_override: int | None = None,
     out_w: int = 1080,
     out_h: int = 1920,
 ) -> dict:
@@ -681,7 +754,6 @@ def convert_single_clip(
 
     crop_w = min(src_w, int(round(src_h * (out_w / out_h))))
     crop_h = src_h
-    half_w = crop_w / 2.0
 
     initial_x = raw_x[0] if (raw_x and raw_x[0] is not None) else (
         next((v for v in raw_x if v is not None), src_w / 2.0)
@@ -705,54 +777,60 @@ def convert_single_clip(
         f"(min={min_conf:.3f}, max={max_conf:.3f}) | alpha={alpha} | smooth_s={smooth_seconds:.2f} | gap_max={gap_frames}"
     )
 
-    tmp_silent = tmp_dir / f"{input_path.stem}_silent.mp4"
-    tmp_mux = tmp_dir / f"{input_path.stem}_reel_mux.mp4"
-
-    cap2 = cv2.VideoCapture(str(input_path))
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(tmp_silent), fourcc, fps, (out_w, out_h))
-
-    idx = 0
-    try:
-        while True:
-            ret, frame = cap2.read()
-            if not ret:
-                break
-            cx = smooth_x[idx] if idx < len(smooth_x) else initial_x
-            x1 = max(0, min(int(round(cx - half_w)), src_w - crop_w))
-            cropped = frame[0:crop_h, x1:x1 + crop_w]
-            resized = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
-            writer.write(resized)
-            idx += 1
-    finally:
-        cap2.release()
-        writer.release()
-
+    tmp_mux = tmp_dir / f"{output_path.stem}_{os.getpid()}_{threading.get_ident()}.part.mp4"
     used_encoder = ff_encoder
-    cmd = build_ffmpeg_mux_cmd(tmp_silent, input_path, tmp_mux, res, used_encoder)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
 
-    if proc.returncode != 0 and used_encoder != "libx264":
-        logger.warning(
-            f"[{SCRIPT_NAME}][GPU-FALLBACK] Encoder '{used_encoder}' fallito su {input_path.name} "
-            f"(rc={proc.returncode}): {proc.stderr.strip()} -> fallback su 'libx264'."
+    try:
+        ok_enc, err_enc = encode_cropped_video_direct(
+            input_path=input_path,
+            tmp_out=tmp_mux,
+            smooth_x=smooth_x,
+            initial_x=initial_x,
+            fps=fps,
+            src_w=src_w,
+            crop_w=crop_w,
+            crop_h=crop_h,
+            out_w=out_w,
+            out_h=out_h,
+            res=res,
+            encoder=used_encoder,
+            threads_override=threads_override,
         )
-        used_encoder = "libx264"
-        if tmp_mux.exists():
-            tmp_mux.unlink(missing_ok=True)
-        cmd = build_ffmpeg_mux_cmd(tmp_silent, input_path, tmp_mux, res, used_encoder)
-        proc = subprocess.run(cmd, capture_output=True, text=True)
 
-    if proc.returncode != 0:
-        if tmp_silent.exists():
-            tmp_silent.unlink(missing_ok=True)
-        if tmp_mux.exists():
+        if not ok_enc and used_encoder != "libx264":
+            logger.warning(
+                f"[{SCRIPT_NAME}][GPU-FALLBACK] Encoder '{used_encoder}' fallito su {input_path.name}: "
+                f"{err_enc} -> fallback su 'libx264'."
+            )
+            used_encoder = "libx264"
             tmp_mux.unlink(missing_ok=True)
-        raise RuntimeError(f"Errore FFmpeg mux REEL su {input_path.name} (rc={proc.returncode}): {proc.stderr.strip()}")
+            ok_enc, err_enc = encode_cropped_video_direct(
+                input_path=input_path,
+                tmp_out=tmp_mux,
+                smooth_x=smooth_x,
+                initial_x=initial_x,
+                fps=fps,
+                src_w=src_w,
+                crop_w=crop_w,
+                crop_h=crop_h,
+                out_w=out_w,
+                out_h=out_h,
+                res=res,
+                encoder=used_encoder,
+                threads_override=threads_override,
+            )
 
-    shutil.move(str(tmp_mux), str(output_path))
-    if tmp_silent.exists():
-        tmp_silent.unlink()
+        if not ok_enc:
+            raise RuntimeError(f"Errore FFmpeg REEL su {input_path.name}: {err_enc}")
+
+        os.replace(tmp_mux, output_path)
+    finally:
+        if tmp_mux.exists():
+            try:
+                tmp_mux.unlink()
+            except Exception:
+                pass
+
     logger.info(f"[{SCRIPT_NAME}] Convertita clip REEL ({active_device}, {used_encoder}): '{output_path.name}'")
 
     return {
@@ -810,6 +888,50 @@ def main():
 
     logger.info(f"[{SCRIPT_NAME}] Trovate {len(clips)} clip sorgente: {[c.name for c in clips]}")
 
+    existing_reels = [
+        dirs["out"] / build_reel_clip_name(c, tipo_slug)
+        for c in clips
+        if (dirs["out"] / build_reel_clip_name(c, tipo_slug)).is_file()
+        and (dirs["out"] / build_reel_clip_name(c, tipo_slug)).stat().st_size > 0
+        and (dirs["out"] / build_reel_clip_name(c, tipo_slug)).resolve() != c.resolve()
+    ]
+
+    overwrite_existing = False
+    if existing_reels and not args.auto:
+        print(f"\n{YELLOW}[!] ATTENZIONE: Trovate {len(existing_reels)} clip REEL già presenti in 'OUT/'.{RESET}")
+        print("   1. Sovrascrivi e riconverti tutte le clip")
+        print("   2. Salta (mantieni clip REEL esistenti)")
+        print("   3. Interrompi script")
+        while True:
+            sc = input("👉 Scelta [INVIO = 2 Salta]: ").strip()
+            if sc in ("", "2"):
+                logger.info(f"[{SCRIPT_NAME}] Scelta utente: mantieni {len(existing_reels)} clip REEL esistenti.")
+                break
+            if sc == "1":
+                overwrite_existing = True
+                logger.info(f"[{SCRIPT_NAME}] Scelta utente: sovrascrittura clip REEL.")
+                break
+            if sc == "3":
+                print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
+                logger.info(f"[{SCRIPT_NAME}] Interrotto dall'utente.")
+                return
+            print(f"{RED}[!] Scelta non valida.{RESET}")
+
+    tasks: list[tuple[Path, Path]] = []
+    ok_cnt = err_cnt = 0
+    for clip in clips:
+        out_reel = dirs["out"] / build_reel_clip_name(clip, tipo_slug)
+        if out_reel.is_file() and out_reel.stat().st_size > 0 and out_reel.resolve() != clip.resolve():
+            if args.auto or not overwrite_existing:
+                logger.info(f"[{SCRIPT_NAME}][YOLO-STATS] clip='{clip.name}' | stato=SKIP_EXISTING ('{out_reel.name}')")
+                ok_cnt += 1
+                continue
+        tasks.append((clip, out_reel))
+
+    if not tasks:
+        logger.info(f"[{SCRIPT_NAME}] Completato (SKIP): ok={ok_cnt}, err=0")
+        return
+
     try:
         model_path = prepare_model_path(args.model, dirs["model"], base_dir, logger)
     except Exception as e:
@@ -817,38 +939,51 @@ def main():
         logger.exception(f"[{SCRIPT_NAME}] Errore modello '{args.model}': {e}")
         sys.exit(1)
 
-    tasks: list[tuple[Path, Path]] = []
-    ok_cnt = err_cnt = 0
-    for clip in clips:
-        out_reel = dirs["out"] / build_reel_clip_name(clip, tipo_slug)
-        if out_reel.is_file() and out_reel.stat().st_size > 0 and out_reel.resolve() != clip.resolve():
-            if args.auto:
-                logger.info(f"[{SCRIPT_NAME}][YOLO-STATS] clip='{clip.name}' | stato=SKIP_EXISTING ('{out_reel.name}')")
-                ok_cnt += 1
-                continue
-        tasks.append((clip, out_reel))
-
-    tot_frames = tot_matches = tot_boxes = 0
-    tot_conf_sum = 0.0
-    global_max_conf = 0.0
-
     worker_devices = gpu_info["yolo_devices"]
     models_by_dev: dict[str, tuple[YOLO, str]] = {}
     ball_cls_id = COCO_SPORTS_BALL_CLASS
     ball_cls_name = "sports ball"
 
-    if tasks:
-        try:
-            for dev in worker_devices:
-                m_inst, actual_dev = load_yolo_for_device(model_path, dev, logger)
-                models_by_dev[dev] = (m_inst, actual_dev)
-            first_model = next(iter(models_by_dev.values()))[0]
-            log_model_info(first_model, model_path, logger)
-            ball_cls_id, ball_cls_name = detect_ball_cls(first_model, logger)
-        except Exception as e:
-            print(f"{RED}[X] [{SCRIPT_NAME}] Impossibile caricare il modello '{model_path.name}': {e}{RESET}", file=sys.stderr)
-            logger.exception(f"[{SCRIPT_NAME}] Errore caricamento modello '{model_path.name}': {e}")
-            sys.exit(1)
+    try:
+        for dev in worker_devices:
+            m_inst, actual_dev = load_yolo_for_device(model_path, dev, logger)
+            models_by_dev[dev] = (m_inst, actual_dev)
+        first_model = next(iter(models_by_dev.values()))[0]
+        log_model_info(first_model, model_path, logger)
+        ball_cls_id, ball_cls_name = detect_ball_cls(first_model, logger)
+    except Exception as e:
+        print(f"{RED}[X] [{SCRIPT_NAME}] Impossibile caricare il modello '{model_path.name}': {e}{RESET}", file=sys.stderr)
+        logger.exception(f"[{SCRIPT_NAME}] Errore caricamento modello '{model_path.name}': {e}")
+        sys.exit(1)
+
+    tot_frames = tot_matches = tot_boxes = 0
+    tot_conf_sum = 0.0
+    global_max_conf = 0.0
+
+    num_workers = min(len(tasks), len(worker_devices)) if len(worker_devices) > 1 else 1
+    threads_per_worker = max(1, res["threads"] // max(1, num_workers))
+
+    def _run_task(task_idx: int, clip_in: Path, clip_out: Path) -> dict:
+        dev_key = worker_devices[task_idx % len(worker_devices)]
+        m_inst, actual_dev = models_by_dev[dev_key]
+        return convert_single_clip(
+            input_path=clip_in,
+            output_path=clip_out,
+            tmp_dir=dirs["tmp"],
+            model=m_inst,
+            model_path=model_path,
+            ball_cls_id=ball_cls_id,
+            ball_cls_name=ball_cls_name,
+            conf=args.conf,
+            imgsz=imgsz,
+            alpha=args.alpha,
+            gap_frames=args.gap_frames,
+            res=res,
+            assigned_device=actual_dev,
+            ff_encoder=gpu_info["ff_encoder"],
+            logger=logger,
+            threads_override=threads_per_worker,
+        )
 
     with tqdm(
         total=len(clips),
@@ -858,31 +993,9 @@ def main():
         colour="magenta",
         ncols=82,
     ) as bar:
-        if len(tasks) > 1 and len(worker_devices) > 1:
-            logger.info(f"[{SCRIPT_NAME}][MULTI-GPU] Avvio elaborazione parallela su {len(worker_devices)} dispositivi: {worker_devices}")
-
-            def _run_task(task_idx: int, clip_in: Path, clip_out: Path) -> dict:
-                dev_key = worker_devices[task_idx % len(worker_devices)]
-                m_inst, actual_dev = models_by_dev[dev_key]
-                return convert_single_clip(
-                    input_path=clip_in,
-                    output_path=clip_out,
-                    tmp_dir=dirs["tmp"],
-                    model=m_inst,
-                    model_path=model_path,
-                    ball_cls_id=ball_cls_id,
-                    ball_cls_name=ball_cls_name,
-                    conf=args.conf,
-                    imgsz=imgsz,
-                    alpha=args.alpha,
-                    gap_frames=args.gap_frames,
-                    res=res,
-                    assigned_device=actual_dev,
-                    ff_encoder=gpu_info["ff_encoder"],
-                    logger=logger,
-                )
-
-            with ThreadPoolExecutor(max_workers=len(worker_devices)) as pool:
+        if num_workers > 1:
+            logger.info(f"[{SCRIPT_NAME}][MULTI-GPU] Avvio elaborazione parallela su {num_workers} dispositivi: {worker_devices}")
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
                 futures = {
                     pool.submit(_run_task, i, c_in, c_out): c_in
                     for i, (c_in, c_out) in enumerate(tasks)
@@ -905,30 +1018,11 @@ def main():
                         print(f"\n{RED}[X] [{SCRIPT_NAME}] Errore su '{clip.name}': {e} (log: {log_file.name}){RESET}", file=sys.stderr)
                     bar.update(1)
         else:
-            dev_key = worker_devices[0] if worker_devices else "cpu"
-            m_inst, actual_dev = models_by_dev[dev_key] if dev_key in models_by_dev else load_yolo_for_device(model_path, "cpu", logger)
-            for clip, out_reel in tasks:
-                label = short_clip_name(clip, tipo_slug)
-                bar.postfix = f" - {label}"
+            for i, (clip, out_reel) in enumerate(tasks):
+                bar.postfix = f" - {short_clip_name(clip, tipo_slug)}"
                 bar.refresh()
                 try:
-                    st = convert_single_clip(
-                        input_path=clip,
-                        output_path=out_reel,
-                        tmp_dir=dirs["tmp"],
-                        model=m_inst,
-                        model_path=model_path,
-                        ball_cls_id=ball_cls_id,
-                        ball_cls_name=ball_cls_name,
-                        conf=args.conf,
-                        imgsz=imgsz,
-                        alpha=args.alpha,
-                        gap_frames=args.gap_frames,
-                        res=res,
-                        assigned_device=actual_dev,
-                        ff_encoder=gpu_info["ff_encoder"],
-                        logger=logger,
-                    )
+                    st = _run_task(i, clip, out_reel)
                     tot_frames += st["frames"]
                     tot_matches += st["matches"]
                     tot_boxes += st["boxes"]
@@ -948,7 +1042,7 @@ def main():
     logger.info(
         f"[{SCRIPT_NAME}][YOLO-SUMMARY] model='{model_path.name}' | devices={worker_devices} | "
         f"ff_encoder='{gpu_info['ff_encoder']}' | clips_ok={ok_cnt}/{len(clips)} | "
-        f"clips_err={err_cnt} | total_frames={tot_frames} | total_matches={tot_matches} "
+        f"clips_err={err_cnt} | total_frames={tot_frames} | total_matches={tot_matches} | "
         f"({overall_ratio:.1f}%) | total_boxes={tot_boxes} | avg_conf={overall_avg_conf:.3f} | max_conf={global_max_conf:.3f}"
     )
     logger.info(f"[{SCRIPT_NAME}] Completato: ok={ok_cnt}, err={err_cnt}")
