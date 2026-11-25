@@ -13,6 +13,7 @@ from tqdm import tqdm
 SCRIPT_NAME = "03_BAHS_identify-timestamps-ALL"
 DEFAULT_SPEED = 1.0
 ALLOWED_CHOICES = (2.0, 4.0)
+LARGE_SKIP_FRAMES_THRESHOLD = 12
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -80,15 +81,11 @@ def calcola_risorse() -> dict:
     threads = os.cpu_count() or 4
     cores = max(2, threads // 2)
     ram_tot, ram_avail = rileva_ram_gb()
-    max_workers = 2 if (threads <= 4 or ram_avail < 6.0) else min(cores, 8)
-    threads_per_worker = max(1, min(4, threads // max_workers))
     return {
         "threads": threads,
         "cores": cores,
         "ram_tot": ram_tot,
         "ram_avail": ram_avail,
-        "max_workers": max_workers,
-        "threads_per_worker": threads_per_worker,
     }
 
 
@@ -148,16 +145,16 @@ def risolvi_file_timestamp_generico(out_dir: Path) -> Path:
     return out_dir / "timestamps.txt"
 
 
-def sincronizza_timestamp_generico(src_txt: Path, out_dir: Path, logger: logging.Logger) -> Path:
+def sincronizza_timestamp_generico(src_txt: Path, out_dir: Path, logger: logging.Logger, overwrite_generic: bool = False) -> Path:
     dst_txt = risolvi_file_timestamp_generico(out_dir)
     if src_txt.resolve() == dst_txt.resolve():
         return dst_txt
-    if dst_txt.is_file() and dst_txt.stat().st_size > 0 and leggi_timestamp_salvati(dst_txt):
+    if not overwrite_generic and dst_txt.is_file() and dst_txt.stat().st_size > 0 and leggi_timestamp_salvati(dst_txt):
         logger.info(f"[{SCRIPT_NAME}] Mantenuto file timestamp generico esistente '{dst_txt}'.")
         return dst_txt
     if src_txt.is_file() and src_txt.stat().st_size > 0:
         shutil.copy2(src_txt, dst_txt)
-        logger.info(f"[{SCRIPT_NAME}] Copiato '{src_txt}' su '{dst_txt}'.")
+        logger.info(f"[{SCRIPT_NAME}] Sincronizzato '{src_txt}' su '{dst_txt}'.")
     return dst_txt
 
 
@@ -220,7 +217,7 @@ def put_contrasted_text(frame, text: str, org: tuple[int, int], font_scale: floa
     cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
 
 
-def draw_overlay(frame, current_sec: float, total_sec: float, speed: float, paused: bool, recorded_times: list[str], flash_timer: float, session_label: str):
+def draw_overlay(frame, current_sec: float, total_sec: float, speed: float, paused: bool, recorded_times: list[str], flash_active: bool, session_label: str):
     h, w, _ = frame.shape
     put_contrasted_text(frame, f"Sessione: {session_label}", (20, 45), 0.9, (0, 255, 255), 2)
 
@@ -238,7 +235,7 @@ def draw_overlay(frame, current_sec: float, total_sec: float, speed: float, paus
         put_contrasted_text(frame, f"[{i}] Canestro: {t}", (20, y_offset), 0.65, (255, 255, 0), 2)
         y_offset += 35
 
-    if time.time() < flash_timer:
+    if flash_active:
         put_contrasted_text(frame, "CANESTRO REGISTRATO!", (w // 2 - 320, h // 2), 1.4, (0, 255, 0), 3)
 
     bar_x, bar_y, bar_w, bar_h = 30, h - 85, w - 60, 16
@@ -256,13 +253,28 @@ def draw_overlay(frame, current_sec: float, total_sec: float, speed: float, paus
     return frame
 
 
+def seek_to_seconds(cap, target_sec: float, fps: float, total_frames: int) -> tuple[bool, object, int, float]:
+    clamped_sec = max(0.0, target_sec)
+    if total_frames > 0:
+        max_frame = max(0, total_frames - 1)
+        target_frame = min(max_frame, int(round(clamped_sec * fps)))
+    else:
+        target_frame = int(round(clamped_sec * fps))
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        return False, None, target_frame, clamped_sec
+    return True, frame, target_frame, target_frame / fps
+
+
 def porta_in_primo_piano(window_title: str):
     if os.name == "nt":
         try:
             user32 = ctypes.windll.user32
             hwnd = user32.FindWindowW(None, window_title)
             if hwnd:
-                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                user32.ShowWindow(hwnd, 9)
                 user32.SetForegroundWindow(hwnd)
                 user32.SetFocus(hwnd)
         except Exception:
@@ -308,6 +320,7 @@ def main():
     session_label = session_raw if session_raw else default_session
     logger.info(f"[{SCRIPT_NAME}] Sessione impostata: '{session_label}' | target_txt='{txt_path}'")
 
+    overwrite_mode = False
     if txt_path.is_file() and txt_path.stat().st_size > 0:
         logger.warning(f"[{SCRIPT_NAME}] File timestamp '{txt_path}' già esistente (voci={len(existing_timestamps)}).")
         print(f"\n{YELLOW}[!] ATTENZIONE: File '{txt_path.name}' già presente in 'OUT/' ({len(existing_timestamps)} timestamp).{RESET}")
@@ -318,10 +331,11 @@ def main():
             sc = input("👉 Scelta [INVIO = 2 Salta]: ").strip()
             if sc in ("", "2"):
                 if existing_timestamps:
-                    sincronizza_timestamp_generico(txt_path, dirs["out"], logger)
+                    sincronizza_timestamp_generico(txt_path, dirs["out"], logger, overwrite_generic=False)
                 logger.info(f"[{SCRIPT_NAME}] Completato (SKIP): mantenuto '{txt_path}'.")
                 return
             if sc == "1":
+                overwrite_mode = True
                 logger.info(f"[{SCRIPT_NAME}] Scelta utente: sovrascrittura '{txt_path}'.")
                 break
             if sc == "3":
@@ -350,8 +364,8 @@ def main():
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
         fps = 25.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    total_sec = total_frames / fps if fps > 0 else 0.0
+    total_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+    total_sec = (total_frames / fps) if (fps > 0 and total_frames > 0) else 0.0
     logger.info(f"[{SCRIPT_NAME}] Metadati video: fps={fps:.2f} | frames={total_frames} | durata={total_sec:.2f}s")
 
     input("Controlli: [SPAZIO]=Canestro | [P]=Pausa | [F/R]=±5s | [Q]=Salva/Esci. INVIO=Avvia ")
@@ -370,7 +384,10 @@ def main():
     window_title = f"Player Analisi [{SCRIPT_NAME}] - {session_label} ({speed:g}x)"
 
     cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
-    display_frame = draw_overlay(current_frame.copy(), 0.0, total_sec, speed, paused, recorded_times, flash_timer, session_label)
+    display_frame = draw_overlay(current_frame.copy(), 0.0, total_sec, speed, paused, recorded_times, False, session_label)
+    rendered_frame: object | None = display_frame
+    needs_redraw = True
+
     cv2.imshow(window_title, display_frame)
     cv2.setWindowProperty(window_title, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     cv2.waitKey(50)
@@ -384,6 +401,8 @@ def main():
     with tqdm(total=max(1, total_frames), desc="03 | Analisi Video", unit="frame", colour="blue", ncols=78) as pbar:
         try:
             while cap.isOpened():
+                flash_active = time.time() < flash_timer
+
                 if not paused:
                     now = time.perf_counter()
                     expected_sec = anchor_vid + (now - anchor_wall) * speed
@@ -394,27 +413,50 @@ def main():
 
                     frames_to_advance = target_idx - current_frame_idx
                     if frames_to_advance > 0:
-                        grabbed_ok = True
-                        for _ in range(frames_to_advance - 1):
-                            if not cap.grab():
-                                grabbed_ok = False
+                        if frames_to_advance >= LARGE_SKIP_FRAMES_THRESHOLD:
+                            ok_seek, frame, actual_idx, actual_sec = seek_to_seconds(
+                                cap, target_idx / fps, fps, total_frames
+                            )
+                            if not ok_seek or frame is None:
                                 break
-                        if not grabbed_ok or not cap.grab():
-                            break
-                        ret, frame = cap.retrieve()
-                        if not ret or frame is None:
-                            break
-                        current_frame = frame
-                        current_frame_idx = target_idx
-                        current_sec = current_frame_idx / fps
+                            current_frame = frame
+                            current_frame_idx = actual_idx
+                            current_sec = actual_sec
+                        else:
+                            grabbed_ok = True
+                            for _ in range(frames_to_advance - 1):
+                                if not cap.grab():
+                                    grabbed_ok = False
+                                    break
+                            if not grabbed_ok or not cap.grab():
+                                break
+                            ret, frame = cap.retrieve()
+                            if not ret or frame is None:
+                                break
+                            current_frame = frame
+                            current_frame_idx = target_idx
+                            current_sec = current_frame_idx / fps
+                        needs_redraw = True
 
                 if total_frames > 0:
                     target_pbar = min(total_frames, current_frame_idx + 1)
                     if target_pbar > pbar.n:
                         pbar.update(target_pbar - pbar.n)
 
-                display_frame = draw_overlay(current_frame.copy(), current_sec, total_sec, speed, paused, recorded_times, flash_timer, session_label)
-                cv2.imshow(window_title, display_frame)
+                if needs_redraw or flash_active or rendered_frame is None:
+                    rendered_frame = draw_overlay(
+                        current_frame.copy(),
+                        current_sec,
+                        total_sec,
+                        speed,
+                        paused,
+                        recorded_times,
+                        flash_active,
+                        session_label,
+                    )
+                    needs_redraw = False
+
+                cv2.imshow(window_title, rendered_frame)
 
                 if paused:
                     wait_ms = 30
@@ -429,37 +471,39 @@ def main():
                     break
                 elif key in (ord("p"), ord("P")):
                     paused = not paused
+                    needs_redraw = True
                     if not paused:
                         anchor_wall = time.perf_counter()
                         anchor_vid = current_sec
                         porta_in_primo_piano(window_title)
                 elif key in (ord("f"), ord("F")):
-                    target_sec = min(total_sec, current_sec + 5.0)
-                    target_frame = min(max(0, total_frames - 1), max(0, int(round(target_sec * fps))))
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-                    ret, frame = cap.read()
-                    if ret and frame is not None:
+                    ok_seek, frame, actual_idx, actual_sec = seek_to_seconds(
+                        cap, current_sec + 5.0, fps, total_frames
+                    )
+                    if ok_seek and frame is not None:
                         current_frame = frame
-                        current_frame_idx = target_frame
-                        current_sec = current_frame_idx / fps
+                        current_frame_idx = actual_idx
+                        current_sec = actual_sec
                         anchor_wall = time.perf_counter()
                         anchor_vid = current_sec
+                        needs_redraw = True
                 elif key in (ord("r"), ord("R")):
-                    target_sec = max(0.0, current_sec - 5.0)
-                    target_frame = max(0, int(round(target_sec * fps)))
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-                    ret, frame = cap.read()
-                    if ret and frame is not None:
+                    ok_seek, frame, actual_idx, actual_sec = seek_to_seconds(
+                        cap, current_sec - 5.0, fps, total_frames
+                    )
+                    if ok_seek and frame is not None:
                         current_frame = frame
-                        current_frame_idx = target_frame
-                        current_sec = current_frame_idx / fps
+                        current_frame_idx = actual_idx
+                        current_sec = actual_sec
                         anchor_wall = time.perf_counter()
                         anchor_vid = current_sec
+                        needs_redraw = True
                 elif key == 32:
                     t_str = seconds_to_time_str(current_sec)
                     if t_str not in recorded_times:
                         recorded_times.append(t_str)
                         flash_timer = time.time() + 0.6
+                        needs_redraw = True
                         pbar.set_postfix({"canestri": len(recorded_times)})
                         logger.info(f"[{SCRIPT_NAME}] Registrato timestamp: {t_str} (frame={current_frame_idx})")
         finally:
@@ -470,7 +514,7 @@ def main():
         content = f"# Sessione: {session_label} | Script: {SCRIPT_NAME}\n" + "\n".join(recorded_times) + "\n"
         txt_path.write_text(content, encoding="utf-8")
         logger.info(f"[{SCRIPT_NAME}] Salvati {len(recorded_times)} timestamp in '{txt_path}': {recorded_times}")
-        sincronizza_timestamp_generico(txt_path, dirs["out"], logger)
+        sincronizza_timestamp_generico(txt_path, dirs["out"], logger, overwrite_generic=overwrite_mode)
     else:
         print(f"{YELLOW}[!] [{SCRIPT_NAME}] Nessun timestamp registrato (log: {log_file.name}).{RESET}", file=sys.stderr)
         logger.warning(f"[{SCRIPT_NAME}] Sessione terminata senza timestamp registrati.")
