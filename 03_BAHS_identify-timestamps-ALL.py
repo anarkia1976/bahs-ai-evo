@@ -13,7 +13,7 @@ from tqdm import tqdm
 SCRIPT_NAME = "03_BAHS_identify-timestamps-ALL"
 DEFAULT_SPEED = 1.0
 ALLOWED_CHOICES = (2.0, 4.0)
-LARGE_SKIP_FRAMES_THRESHOLD = 12
+LARGE_SKIP_FRAMES_THRESHOLD = 6
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -213,8 +213,8 @@ def chiedi_velocita(default_speed: float = DEFAULT_SPEED) -> float:
 
 
 def put_contrasted_text(frame, text: str, org: tuple[int, int], font_scale: float, color: tuple[int, int, int], thickness: int = 2):
-    cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
-    cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
+    cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_8)
+    cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_8)
 
 
 def draw_overlay(frame, current_sec: float, total_sec: float, speed: float, paused: bool, recorded_times: list[str], flash_active: bool, session_label: str):
@@ -397,6 +397,7 @@ def main():
     current_sec = 0.0
     anchor_wall = time.perf_counter()
     anchor_vid = 0.0
+    frame_interval_sec = 1.0 / fps
 
     with tqdm(total=max(1, total_frames), desc="03 | Analisi Video", unit="frame", colour="blue", ncols=78) as pbar:
         try:
@@ -411,17 +412,19 @@ def main():
                     if total_frames > 0 and target_idx >= total_frames:
                         break
 
-                    frames_to_advance = target_idx - current_frame_idx
-                    if frames_to_advance > 0:
+                    if target_idx > current_frame_idx:
+                        frames_to_advance = target_idx - current_frame_idx
                         if frames_to_advance >= LARGE_SKIP_FRAMES_THRESHOLD:
                             ok_seek, frame, actual_idx, actual_sec = seek_to_seconds(
-                                cap, target_idx / fps, fps, total_frames
+                                cap, expected_sec, fps, total_frames
                             )
                             if not ok_seek or frame is None:
                                 break
                             current_frame = frame
                             current_frame_idx = actual_idx
                             current_sec = actual_sec
+                            anchor_wall = time.perf_counter()
+                            anchor_vid = current_sec
                         else:
                             grabbed_ok = True
                             for _ in range(frames_to_advance - 1):
@@ -434,13 +437,13 @@ def main():
                             if not ret or frame is None:
                                 break
                             current_frame = frame
-                            current_frame_idx = target_idx
+                            current_frame_idx = current_frame_idx + frames_to_advance
                             current_sec = current_frame_idx / fps
                         needs_redraw = True
 
                 if total_frames > 0:
                     target_pbar = min(total_frames, current_frame_idx + 1)
-                    if target_pbar > pbar.n:
+                    if target_pbar > pbar.n and (target_pbar - pbar.n >= 15 or target_pbar >= total_frames):
                         pbar.update(target_pbar - pbar.n)
 
                 if needs_redraw or flash_active or rendered_frame is None:
@@ -459,11 +462,11 @@ def main():
                 cv2.imshow(window_title, rendered_frame)
 
                 if paused:
-                    wait_ms = 30
+                    wait_ms = 25
                 else:
-                    next_sec = (current_frame_idx + 1) / fps
+                    next_sec = (current_frame_idx + 1) * frame_interval_sec
                     time_until_next = (next_sec - anchor_vid) / speed - (time.perf_counter() - anchor_wall)
-                    wait_ms = max(10, int(time_until_next * 1000))
+                    wait_ms = 1 if time_until_next <= 0.002 else max(1, min(10, int(time_until_next * 1000)))
 
                 key = cv2.waitKey(wait_ms) & 0xFF
                 if key in (ord("q"), ord("Q")):
