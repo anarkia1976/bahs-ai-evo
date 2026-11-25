@@ -144,18 +144,26 @@ def setup_dirs_and_logger(base_dir: Path) -> tuple[dict[str, Path], logging.Logg
     return dirs, logger, log_file
 
 
-def get_duration_ms(video_path: Path) -> int:
+def probe_media_info(video_path: Path) -> tuple[int, bool]:
     cmd = [
         "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "-show_entries", "format=duration:stream=codec_type",
+        "-of", "default=noprint_wrappers=1",
         str(video_path),
     ]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        return max(0, int(round(float(res.stdout.strip()) * 1000.0)))
-    except ValueError:
-        return 0
+    duration_ms = 0
+    has_audio = False
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("duration="):
+            try:
+                duration_ms = max(0, int(round(float(line.split("=", 1)[1]) * 1000.0)))
+            except ValueError:
+                duration_ms = 0
+        elif line == "codec_type=audio":
+            has_audio = True
+    return duration_ms, has_audio
 
 
 def parse_progress_ms(line: str) -> int | None:
@@ -202,8 +210,14 @@ def gestione_file_esistente(out_file: Path, auto: bool, logger: logging.Logger) 
 
 def select_input_video(out_dir: Path, final_dir: Path, tmp_dir: Path, tipo_raw: str, tipo_slug: str, fmt_slug: str, auto: bool) -> Path | None:
     if is_non_highlights_mode(tipo_raw):
-        scelta_file = out_dir / f"{tipo_slug}_1080P_merged_orig.mp4"
-        return scelta_file if scelta_file.is_file() else None
+        candidates_non_hl = [
+            out_dir / f"{tipo_slug}_{fmt_slug}_merged_orig.mp4",
+            out_dir / f"{tipo_slug}_1080P_merged_orig.mp4",
+        ]
+        for cand in candidates_non_hl:
+            if cand.is_file():
+                return cand
+        return None
 
     candidates = [
         tmp_dir / build_stage_name(tipo_slug, fmt_slug, fade=True),
@@ -248,13 +262,11 @@ def attendi_brani_in_cartella_music(music_dir: Path, logger: logging.Logger) -> 
 
         print(f"\n{RED}{BOLD}[X] [{SCRIPT_NAME}] Nessun brano trovato nella cartella 'MUSIC/' ({', '.join(AUDIO_EXTS)}).{RESET}", file=sys.stderr)
         print(f"{YELLOW}[!] Inserisci almeno un file audio nella cartella 'MUSIC/' prima di proseguire.{RESET}")
-        sc = input("\n👉 Premi [INVIO] per riavviare lo script (oppure '0' per uscire): ").strip().lower()
+        sc = input("\n👉 Premi [INVIO] per ricontrollare 'MUSIC/' (oppure '0' per uscire): ").strip().lower()
         if sc in ("0", "q", "quit", "exit"):
             print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
             logger.info(f"[{SCRIPT_NAME}] Uscita richiesta dall'utente per mancanza brani in MUSIC/.")
             sys.exit(1)
-
-        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def main():
@@ -290,7 +302,7 @@ def main():
     in_video = select_input_video(dirs["out"], dirs["final"], dirs["tmp"], args.tipo, tipo_slug, fmt_slug, args.auto)
     if not in_video or not in_video.is_file():
         if is_non_highlights_mode(args.tipo):
-            msg = f"Video sorgente 'OUT/{tipo_slug}_1080P_merged_orig.mp4' non trovato."
+            msg = f"Video sorgente per '{tipo_slug}' ({fmt_slug}) non trovato in 'OUT/'."
         else:
             msg = "Nessun video unito trovato in 'FINAL/' o 'TMP/'."
         print(f"{RED}[X] [{SCRIPT_NAME}] {msg}{RESET}", file=sys.stderr)
@@ -300,7 +312,7 @@ def main():
     fade_flag = extract_fade_flag(in_video, default_fade=True)
     stage_name = build_stage_name(tipo_slug, fmt_slug, fade=fade_flag, music=True)
     out_file = dirs["final"] / stage_name
-    tmp_out_file = dirs["tmp"] / stage_name
+    tmp_out_file = dirs["tmp"] / f"{out_file.stem}_{os.getpid()}.part.mp4"
 
     logger.info(f"[{SCRIPT_NAME}] Video input='{in_video}' | fade={fade_flag} | out_file='{out_file}'")
 
@@ -314,23 +326,36 @@ def main():
 
     music_files = attendi_brani_in_cartella_music(dirs["music"], logger)
     selected_music = music_files[0]
-    total_ms = get_duration_ms(in_video)
-    logger.info(f"[{SCRIPT_NAME}] Traccia audio selezionata='{selected_music}' | durata_video_ms={total_ms}")
+    total_ms, has_orig_audio = probe_media_info(in_video)
+    logger.info(
+        f"[{SCRIPT_NAME}] Traccia audio selezionata='{selected_music}' | "
+        f"durata_video_ms={total_ms} | orig_has_audio={has_orig_audio}"
+    )
+
+    if has_orig_audio:
+        filter_complex = (
+            f"[0:a]volume={ORIGINAL_AUDIO_VOLUME}[orig];"
+            f"[1:a]volume={MUSIC_VOLUME}[mus];"
+            f"[orig][mus]amix=inputs=2:duration=first:normalize=0:dropout_transition=2[aout]"
+        )
+    else:
+        filter_complex = f"[1:a]volume={MUSIC_VOLUME}[aout]"
 
     cmd = [
         "ffmpeg",
+        "-nostdin",
         "-loglevel", "error",
         "-i", str(in_video),
         "-stream_loop", "-1",
         "-i", str(selected_music),
-        "-filter_complex",
-        f"[0:a]volume={ORIGINAL_AUDIO_VOLUME}[orig];[1:a]volume={MUSIC_VOLUME}[mus];[orig][mus]amix=inputs=2:duration=first:dropout_transition=2[aout]",
-        "-map", "0:v",
+        "-filter_complex", filter_complex,
+        "-map", "0:v:0",
         "-map", "[aout]",
         "-c:v", "copy",
         "-threads", str(res["threads"]),
         "-c:a", "aac",
         "-b:a", "192k",
+        "-movflags", "+faststart",
         "-shortest",
         "-progress", "pipe:1",
         "-nostats",
@@ -382,7 +407,7 @@ def main():
             logger.error(f"[{SCRIPT_NAME}] Errore FFmpeg (rc={rc}): {err_msg}")
             sys.exit(1)
 
-        shutil.move(str(tmp_out_file), str(out_file))
+        os.replace(tmp_out_file, out_file)
         size_mb = out_file.stat().st_size / (1024 * 1024)
         logger.info(f"[{SCRIPT_NAME}] Completato con successo: '{out_file}' ({size_mb:.2f} MB, musica='{selected_music.name}')")
     finally:
