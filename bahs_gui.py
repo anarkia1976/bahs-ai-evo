@@ -112,8 +112,8 @@ class BahsGuiApp(BaseWindow):
             super().__init__()
 
         self.title("BAHS · Basketball Highlights Automation Suite")
-        self.geometry("1120x840")
-        self.minsize(1000, 740)
+        self.geometry("1120x860")
+        self.minsize(1000, 760)
 
         self.base_dir_var = tk.StringVar(value=str(Path(__file__).resolve().parent))
         self.tipo_var = tk.StringVar(value=DEFAULT_TOP_TEXT)
@@ -122,6 +122,7 @@ class BahsGuiApp(BaseWindow):
         self.formato_var = tk.StringVar(value=DEFAULT_FORMAT)
 
         # Parametri opzionali per step specifici
+        self.ts_speed_var = tk.StringVar(value="1.0")
         self.before_var = tk.StringVar(value="3.0")
         self.after_var = tk.StringVar(value="3.0")
         self.model_var = tk.StringVar(value="yolo26l.pt")
@@ -674,7 +675,7 @@ class BahsGuiApp(BaseWindow):
 
         self.log_text = tk.Text(
             log_box,
-            height=10,
+            height=9,
             wrap=tk.NONE,
             font=("Consolas", 9),
             bg=bg_log,
@@ -771,6 +772,26 @@ class BahsGuiApp(BaseWindow):
         steps_box.columnconfigure(1, weight=1)
 
     def _build_advanced_tab(self, parent: ttk.Frame) -> None:
+        ts_box = ttk.LabelFrame(parent, padding=10)
+        ts_box.pack(fill=X, pady=(0, 10))
+        self._build_adv_step_header(
+            ts_box,
+            "03",
+            "#f59e0b",
+            "Identifica Timestamp",
+            "Velocità di riproduzione durante la marcatura dal vivo (sessione da sottotitolo e video da tipo)",
+        )
+        ts_ctrls = ttk.Frame(ts_box)
+        ts_ctrls.pack(fill=X, padx=(44, 0))
+        ttk.Label(ts_ctrls, text="Velocità riproduzione:").pack(side=LEFT)
+        ttk.Combobox(
+            ts_ctrls,
+            textvariable=self.ts_speed_var,
+            values=["1.0", "2.0", "4.0"],
+            state="readonly",
+            width=8,
+        ).pack(side=LEFT, padx=(6, 0))
+
         split_box = ttk.LabelFrame(parent, padding=10)
         split_box.pack(fill=X, pady=(0, 10))
         self._build_adv_step_header(
@@ -996,7 +1017,9 @@ class BahsGuiApp(BaseWindow):
             "--formato", fmt,
         ]
 
-        if script_name == "04_BAHS_split-original-ALL.py":
+        if script_name == "03_BAHS_identify-timestamps-ALL.py":
+            cmd.extend(["--speed", self.ts_speed_var.get().strip() or "1.0"])
+        elif script_name == "04_BAHS_split-original-ALL.py":
             cmd.extend(["--before", self.before_var.get().strip() or "3.0", "--after", self.after_var.get().strip() or "3.0"])
         elif script_name == "05_BAHS_convert-clips-REEL.py":
             cmd.extend([

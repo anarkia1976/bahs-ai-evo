@@ -28,7 +28,7 @@ from bahs_core import (
 
 SCRIPT_NAME = "03_BAHS_identify-timestamps-ALL"
 DEFAULT_SPEED = 1.0
-ALLOWED_CHOICES = (2.0, 4.0)
+ALLOWED_CHOICES = (1.0, 2.0, 4.0)
 LARGE_SKIP_FRAMES_THRESHOLD = 6
 
 
@@ -43,21 +43,6 @@ def controlla_timestamp_out(out_dir: Path, txt_path: Path, logger: logging.Logge
     else:
         logger.warning(f"[{SCRIPT_NAME}] File '{txt_path}' presente ma privo di timestamp validi.")
     return saved_times
-
-
-def chiedi_velocita(default_speed: float = DEFAULT_SPEED) -> float:
-    while True:
-        raw = input(f"🚀 Velocità riproduzione [INVIO = {default_speed:g}x | scelta: 2x, 4x]: ").strip()
-        if not raw:
-            return float(default_speed)
-        norm = raw.lower().rstrip("x").strip().replace(",", ".")
-        try:
-            val = float(norm)
-            if val in ALLOWED_CHOICES:
-                return val
-        except ValueError:
-            pass
-        print(f"{RED}[!] Scelta non valida. Premi INVIO per {default_speed:g}x oppure inserisci 2x o 4x.{RESET}")
 
 
 def put_contrasted_text(
@@ -153,6 +138,7 @@ def main() -> None:
     parser.add_argument("--tipo", default="HIGHLIGHTS")
     parser.add_argument("--sottotitolo", default="CAMPIONATO - TEAM vs TEAM")
     parser.add_argument("--formato", default="1080P")
+    parser.add_argument("--speed", type=float, default=DEFAULT_SPEED, help="Velocità riproduzione (es. 1.0, 2.0, 4.0)")
     parser.add_argument("--auto", action="store_true")
     args = parser.parse_args()
 
@@ -164,11 +150,13 @@ def main() -> None:
     tipo_slug = sanitize_slug(args.tipo)
     fmt_slug = normalize_format(args.formato)
 
-    default_session = f"{tipo_slug}_{fmt_slug}_{sanitize_slug(args.sottotitolo)}"
+    session_label = f"{tipo_slug}_{fmt_slug}_{sanitize_slug(args.sottotitolo)}"
+    speed = float(args.speed) if float(args.speed) in ALLOWED_CHOICES else DEFAULT_SPEED
 
     logger.info(
         f"[{SCRIPT_NAME}] Avvio | base_dir='{base_dir}' | tipo='{args.tipo}' | "
-        f"sottotitolo='{args.sottotitolo}' | formato='{fmt_slug}' | auto={args.auto} | risorse={res}"
+        f"sottotitolo='{args.sottotitolo}' | formato='{fmt_slug}' | session='{session_label}' | "
+        f"speed={speed:g} | auto={args.auto} | risorse={res}"
     )
 
     specific_txt, generic_txt = resolve_timestamp_files(dirs["out"], tipo_slug, fmt_slug)
@@ -178,44 +166,43 @@ def main() -> None:
         txt_path = specific_txt
 
     existing_timestamps = controlla_timestamp_out(dirs["out"], txt_path, logger)
-
-    session_raw = input(f"🏷️  Etichetta sessione [INVIO = {default_session}]: ").strip()
-    session_label = session_raw if session_raw else default_session
     logger.info(f"[{SCRIPT_NAME}] Sessione impostata: '{session_label}' | target_txt='{txt_path}'")
 
     overwrite_mode = False
     if txt_path.is_file() and txt_path.stat().st_size > 0:
-        logger.warning(f"[{SCRIPT_NAME}] File timestamp '{txt_path}' già esistente (voci={len(existing_timestamps)}).")
-        print(f"\n{YELLOW}[!] ATTENZIONE: File '{txt_path.name}' già presente in 'OUT/' ({len(existing_timestamps)} timestamp).{RESET}")
-        print("   1. Sovrascrivi e registra nuovi timestamp")
-        print("   2. Salta (mantieni timestamp esistenti)")
-        print("   3. Interrompi script")
-        while True:
-            sc = input("👉 Scelta [INVIO = 2 Salta]: ").strip()
-            if sc in ("", "2"):
-                if existing_timestamps:
-                    sync_generic_timestamps(txt_path, dirs["out"], logger, overwrite_generic=False)
-                logger.info(f"[{SCRIPT_NAME}] Completato (SKIP): mantenuto '{txt_path}'.")
-                return
-            if sc == "1":
-                overwrite_mode = True
-                logger.info(f"[{SCRIPT_NAME}] Scelta utente: sovrascrittura '{txt_path}'.")
-                break
-            if sc == "3":
-                print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
-                logger.info(f"[{SCRIPT_NAME}] Interrotto dall'utente su file esistente.")
-                return
-            print(f"{RED}[!] Scelta non valida.{RESET}")
+        if args.auto:
+            overwrite_mode = True
+            logger.info(f"[{SCRIPT_NAME}] Modalità --auto: sovrascrittura '{txt_path}'.")
+        else:
+            logger.warning(f"[{SCRIPT_NAME}] File timestamp '{txt_path}' già esistente (voci={len(existing_timestamps)}).")
+            print(f"\n{YELLOW}[!] ATTENZIONE: File '{txt_path.name}' già presente in 'OUT/' ({len(existing_timestamps)} timestamp).{RESET}")
+            print("   1. Sovrascrivi e registra nuovi timestamp")
+            print("   2. Salta (mantieni timestamp esistenti)")
+            print("   3. Interrompi script")
+            while True:
+                sc = input("👉 Scelta [INVIO = 2 Salta]: ").strip()
+                if sc in ("", "2"):
+                    if existing_timestamps:
+                        sync_generic_timestamps(txt_path, dirs["out"], logger, overwrite_generic=False)
+                    logger.info(f"[{SCRIPT_NAME}] Completato (SKIP): mantenuto '{txt_path}'.")
+                    return
+                if sc == "1":
+                    overwrite_mode = True
+                    logger.info(f"[{SCRIPT_NAME}] Scelta utente: sovrascrittura '{txt_path}'.")
+                    break
+                if sc == "3":
+                    print(f"{YELLOW}[!] [{SCRIPT_NAME}] Elaborazione interrotta dall'utente.{RESET}")
+                    logger.info(f"[{SCRIPT_NAME}] Interrotto dall'utente su file esistente.")
+                    return
+                print(f"{RED}[!] Scelta non valida.{RESET}")
 
     default_video_name = f"{tipo_slug}_{fmt_slug}_merged_orig.mp4"
-    video_name = input(f"📁 Nome video in 'OUT/' [INVIO = {default_video_name}]: ").strip()
-    video_path = resolve_merged_orig_path(dirs["out"], tipo_slug, fmt_slug, video_name or None)
+    video_path = resolve_merged_orig_path(dirs["out"], tipo_slug, fmt_slug, None)
     if not video_path:
-        print(f"{RED}[X] [{SCRIPT_NAME}] Video non trovato in 'OUT/': {video_name or default_video_name}{RESET}", file=sys.stderr)
-        logger.error(f"[{SCRIPT_NAME}] Video non trovato in OUT (richiesto='{video_name or default_video_name}').")
+        print(f"{RED}[X] [{SCRIPT_NAME}] Video non trovato in 'OUT/': {default_video_name}{RESET}", file=sys.stderr)
+        logger.error(f"[{SCRIPT_NAME}] Video non trovato in OUT (richiesto='{default_video_name}').")
         sys.exit(1)
 
-    speed = chiedi_velocita(default_speed=DEFAULT_SPEED)
     logger.info(f"[{SCRIPT_NAME}] Video sorgente='{video_path}' | velocità={speed:g}x")
 
     cap = cv2.VideoCapture(str(video_path))
@@ -230,8 +217,6 @@ def main() -> None:
     total_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
     total_sec = (total_frames / fps) if (fps > 0 and total_frames > 0) else 0.0
     logger.info(f"[{SCRIPT_NAME}] Metadati video: fps={fps:.2f} | frames={total_frames} | durata={total_sec:.2f}s")
-
-    input("Controlli: [SPAZIO]=Canestro | [P]=Pausa | [F/R]=±5s | [Q]=Salva/Esci. INVIO=Avvia ")
 
     ret, current_frame = cap.read()
     if not ret or current_frame is None:
@@ -346,6 +331,8 @@ def main() -> None:
                     ok_seek, frame, actual_idx, actual_sec = seek_to_seconds(
                         cap, current_sec + 5.0, fps, total_frames
                     )
+                    if ok_seek and frame is None:
+                        break
                     if ok_seek and frame is not None:
                         current_frame = frame
                         current_frame_idx = actual_idx
@@ -357,6 +344,8 @@ def main() -> None:
                     ok_seek, frame, actual_idx, actual_sec = seek_to_seconds(
                         cap, current_sec - 5.0, fps, total_frames
                     )
+                    if ok_seek and frame is None:
+                        break
                     if ok_seek and frame is not None:
                         current_frame = frame
                         current_frame_idx = actual_idx
