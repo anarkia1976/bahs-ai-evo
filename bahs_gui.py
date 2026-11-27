@@ -101,7 +101,59 @@ ALL_STEP_SCRIPTS = [
     ),
 ]
 
+STATUS_STYLES = {
+    "pronto": {
+        "label": "Pronto",
+        "core": "#64748b",
+        "light": "#cbd5e1",
+        "dark": "#334155",
+        "glow": "#475569",
+        "pulse": False,
+    },
+    "in_corso": {
+        "label": "In corso",
+        "core": "#f59e0b",
+        "light": "#fef3c7",
+        "dark": "#b45309",
+        "glow": "#f59e0b",
+        "pulse": True,
+    },
+    "errore": {
+        "label": "Errore",
+        "core": "#ef4444",
+        "light": "#fee2e2",
+        "dark": "#991b1b",
+        "glow": "#ef4444",
+        "pulse": True,
+    },
+    "terminato": {
+        "label": "Terminato",
+        "core": "#22c55e",
+        "light": "#dcfce7",
+        "dark": "#166534",
+        "glow": "#22c55e",
+        "pulse": True,
+    },
+}
+
 BaseWindow = ttk.Window if HAS_TTKB else tk.Tk
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return (100, 116, 139)
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _blend_hex(c1: str, c2: str, t: float) -> str:
+    t = max(0.0, min(1.0, t))
+    r1, g1, b1 = _hex_to_rgb(c1)
+    r2, g2, b2 = _hex_to_rgb(c2)
+    r = int(r1 + (r2 - r1) * t)
+    g = int(g1 + (g2 - g1) * t)
+    b = int(b1 + (b2 - b1) * t)
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 class BahsGuiApp(BaseWindow):
@@ -134,15 +186,21 @@ class BahsGuiApp(BaseWindow):
         self.duration_var = tk.StringVar(value="15.0")
 
         self.log_queue: queue.Queue[str] = queue.Queue()
+        self.status_queue: queue.Queue[str] = queue.Queue()
         self.current_proc: subprocess.Popen | None = None
         self.worker_thread: threading.Thread | None = None
         self.stop_requested = False
+
+        self.status_state = "pronto"
+        self._pulse_phase = 0.0
+        self._blink_after_id: str | None = None
 
         self._window_icon_img: tk.PhotoImage | None = None
         self._extra_logo_img: tk.PhotoImage | None = None
 
         self._set_basketball_window_icon()
         self._build_ui()
+        self._set_status_state("pronto")
         self._on_tipo_changed()
         self._refresh_system_info()
         self._refresh_in_videos_status()
@@ -160,7 +218,6 @@ class BahsGuiApp(BaseWindow):
         r = (size - 2 * pad) / 2.0
         line_w = max(2, size // 24)
 
-        # Pallone arancione con bordo scuro
         draw.ellipse(
             [pad, pad, size - pad, size - pad],
             fill=(249, 115, 22, 255),
@@ -168,11 +225,9 @@ class BahsGuiApp(BaseWindow):
             width=line_w,
         )
 
-        # Cucitura orizzontale e verticale
         draw.line([(pad + 1, cy), (size - pad - 1, cy)], fill=(67, 20, 7, 255), width=line_w)
         draw.line([(cx, pad + 1), (cx, size - pad - 1)], fill=(67, 20, 7, 255), width=line_w)
 
-        # Archi laterali del pallone da basket
         left_pts = []
         right_pts = []
         for step in range(-16, 17):
@@ -252,6 +307,119 @@ class BahsGuiApp(BaseWindow):
             font=("Segoe UI", 9, "bold"),
         )
         return canvas
+
+    def _get_panel_bg(self, widget) -> str:
+        if HAS_TTKB:
+            try:
+                style_bg = self.style.colors.get("bg")
+                if style_bg:
+                    return style_bg
+            except Exception:
+                pass
+            return "#22252a"
+        try:
+            bg = widget.cget("background")
+            if bg and bg.startswith("#"):
+                return bg
+        except Exception:
+            pass
+        return "#f0f0f0"
+
+    def _set_status_state(self, state: str) -> None:
+        if state not in STATUS_STYLES:
+            state = "pronto"
+        self.status_state = state
+        self._pulse_phase = 0.0
+
+        if self._blink_after_id is not None:
+            try:
+                self.after_cancel(self._blink_after_id)
+            except Exception:
+                pass
+            self._blink_after_id = None
+
+        info = STATUS_STYLES[state]
+        if hasattr(self, "status_text_lbl"):
+            self.status_text_lbl.configure(text=info["label"])
+
+        self._redraw_status_circle(intensity=1.0)
+
+        if info["pulse"]:
+            self._schedule_status_pulse()
+
+    def _schedule_status_pulse(self) -> None:
+        info = STATUS_STYLES.get(self.status_state, STATUS_STYLES["pronto"])
+        if not info["pulse"]:
+            self._redraw_status_circle(intensity=1.0)
+            return
+
+        def _animate():
+            self._blink_after_id = None
+            if not STATUS_STYLES.get(self.status_state, {}).get("pulse", False):
+                self._redraw_status_circle(intensity=1.0)
+                return
+            self._pulse_phase = (self._pulse_phase + 0.34) % (2.0 * math.pi)
+            intensity = 0.15 + 0.85 * (0.5 * (1.0 + math.cos(self._pulse_phase)))
+            self._redraw_status_circle(intensity=intensity)
+            self._schedule_status_pulse()
+
+        self._blink_after_id = self.after(55, _animate)
+
+    def _redraw_status_circle(self, intensity: float = 1.0) -> None:
+        if not hasattr(self, "status_canvas"):
+            return
+
+        info = STATUS_STYLES.get(self.status_state, STATUS_STYLES["pronto"])
+        bg = self._get_panel_bg(self.status_canvas.master)
+        self.status_canvas.configure(bg=bg)
+        self.status_canvas.delete("all")
+
+        cx, cy = 10.0, 10.0
+        bezel_outer = "#0f172a" if HAS_TTKB else "#94a3b8"
+        bezel_inner = "#334155" if HAS_TTKB else "#cbd5e1"
+        off_base = "#1e293b" if HAS_TTKB else "#cbd5e1"
+
+        if info["pulse"] and intensity > 0.2:
+            glow_outer = _blend_hex(bg, info["glow"], 0.24 * intensity)
+            glow_mid = _blend_hex(bg, info["glow"], 0.45 * intensity)
+            r_glow1 = 9.0 + 0.8 * intensity
+            r_glow2 = 8.1 + 0.5 * intensity
+            self.status_canvas.create_oval(
+                cx - r_glow1, cy - r_glow1, cx + r_glow1, cy + r_glow1,
+                fill=glow_outer, outline=""
+            )
+            self.status_canvas.create_oval(
+                cx - r_glow2, cy - r_glow2, cx + r_glow2, cy + r_glow2,
+                fill=glow_mid, outline=""
+            )
+
+        self.status_canvas.create_oval(
+            cx - 7.6, cy - 7.6, cx + 7.6, cy + 7.6,
+            fill=bezel_outer, outline=bezel_inner, width=1
+        )
+
+        rim_col = _blend_hex(off_base, info["dark"], 0.35 + 0.65 * intensity)
+        mid_col = _blend_hex(off_base, info["core"], 0.25 + 0.75 * intensity)
+        hot_col = _blend_hex(mid_col, info["light"], 0.45 * intensity)
+
+        self.status_canvas.create_oval(
+            cx - 6.1, cy - 6.1, cx + 6.1, cy + 6.1,
+            fill=rim_col, outline=""
+        )
+        self.status_canvas.create_oval(
+            cx - 5.0, cy - 5.0, cx + 5.0, cy + 5.0,
+            fill=mid_col, outline=""
+        )
+        self.status_canvas.create_oval(
+            cx - 3.4, cy - 3.5, cx + 2.8, cy + 2.7,
+            fill=hot_col, outline=""
+        )
+
+        spec_col = _blend_hex(hot_col, "#ffffff", 0.35 + 0.50 * intensity)
+        self.status_canvas.create_oval(
+            cx - 3.6, cy - 3.7, cx - 1.0, cy - 1.3,
+            fill=spec_col, outline=""
+        )
 
     def _build_adv_step_header(self, parent: ttk.Frame, code: str, color: str, title: str, desc: str) -> ttk.Frame:
         header = ttk.Frame(parent)
@@ -664,7 +832,44 @@ class BahsGuiApp(BaseWindow):
         self._btn(action_bar, "📂 FINAL/", lambda: self._open_folder("FINAL"), bootstyle="info-outline").pack(side=LEFT, padx=(0, 6))
         self._btn(action_bar, "📂 OUT/", lambda: self._open_folder("OUT"), bootstyle="secondary-outline").pack(side=LEFT, padx=(0, 6))
         self._btn(action_bar, "📂 LOG/", lambda: self._open_folder("LOG"), bootstyle="secondary-outline").pack(side=LEFT, padx=(0, 6))
-        self._btn(action_bar, "🧹 Pulisci Log", self._clear_log, bootstyle="warning-outline").pack(side=RIGHT)
+
+        btn_clear_log = self._btn(action_bar, "🧹 Pulisci Log", self._clear_log, bootstyle="warning-outline")
+        btn_clear_log.pack(side=RIGHT)
+
+        # Box di stato visibile e allineato a "Pulisci Log"
+        border_col = "#f59e0b"
+        panel_bg = self._get_panel_bg(action_bar)
+        status_box = tk.Frame(
+            action_bar,
+            bg=panel_bg,
+            highlightbackground=border_col,
+            highlightcolor=border_col,
+            highlightthickness=1,
+            bd=0,
+        )
+        status_box.pack(side=RIGHT, padx=(0, 8))
+
+        status_inner = tk.Frame(status_box, bg=panel_bg, padx=9, pady=4)
+        status_inner.pack(side=LEFT)
+
+        self.status_canvas = tk.Canvas(
+            status_inner,
+            width=20,
+            height=20,
+            bg=panel_bg,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.status_canvas.pack(side=LEFT, padx=(0, 6))
+
+        self.status_text_lbl = tk.Label(
+            status_inner,
+            text="Pronto",
+            font=("Segoe UI", 9, "bold"),
+            fg="#f59e0b" if HAS_TTKB else "#b45309",
+            bg=panel_bg,
+        )
+        self.status_text_lbl.pack(side=LEFT)
 
         # --- Console Output Live ---
         log_box = ttk.LabelFrame(main_pad, text="  🖥️ Output Elaborazione  ", padding=10)
@@ -987,9 +1192,14 @@ class BahsGuiApp(BaseWindow):
         self.log_text.configure(state=NORMAL)
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state=DISABLED)
+        if not (self.worker_thread and self.worker_thread.is_alive()):
+            self._set_status_state("pronto")
 
     def _append_log(self, text: str) -> None:
         self.log_queue.put(text)
+
+    def _set_status_from_worker(self, state: str) -> None:
+        self.status_queue.put(state)
 
     def _poll_log_queue(self) -> None:
         while True:
@@ -1001,6 +1211,14 @@ class BahsGuiApp(BaseWindow):
             self.log_text.insert(tk.END, msg)
             self.log_text.see(tk.END)
             self.log_text.configure(state=DISABLED)
+
+        while True:
+            try:
+                next_state = self.status_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._set_status_state(next_state)
+
         self.after(80, self._poll_log_queue)
 
     def _build_script_cmd(self, base_dir: Path, script_name: str, auto: bool) -> list[str]:
@@ -1066,15 +1284,18 @@ class BahsGuiApp(BaseWindow):
 
     def _run_commands_worker(self, base_dir: Path, commands: list[tuple[str, list[str]]]) -> None:
         self.stop_requested = False
+        final_state = "terminato"
         try:
             for script_name, cmd in commands:
                 if self.stop_requested:
                     self._append_log("\n[GUI] Esecuzione interrotta dall'utente.\n")
+                    final_state = "errore"
                     break
 
                 script_path = base_dir / script_name
                 if not script_path.is_file():
                     self._append_log(f"\n[GUI][ERRORE] Script non trovato: {script_path}\n")
+                    final_state = "errore"
                     break
 
                 self._append_log(f"\n=== Avvio {script_name} ===\n")
@@ -1108,13 +1329,19 @@ class BahsGuiApp(BaseWindow):
 
                 if self.stop_requested:
                     self._append_log("\n[GUI] Processo terminato su richiesta.\n")
+                    final_state = "errore"
                     break
                 if rc != 0:
                     self._append_log(f"\n[GUI][ERRORE] {script_name} terminato con codice {rc}. Pipeline fermata.\n")
+                    final_state = "errore"
                     break
                 self._append_log(f"=== Completato {script_name} ===\n")
+        except Exception as exc:
+            self._append_log(f"\n[GUI][ERRORE] Eccezione imprevista: {exc}\n")
+            final_state = "errore"
         finally:
             self.current_proc = None
+            self._set_status_from_worker(final_state)
             self.after(0, self._on_worker_finished)
 
     def _on_worker_finished(self) -> None:
@@ -1132,6 +1359,7 @@ class BahsGuiApp(BaseWindow):
 
         self.btn_run_all.configure(state=DISABLED)
         self.btn_stop.configure(state=NORMAL)
+        self._set_status_state("in_corso")
         self.worker_thread = threading.Thread(target=self._run_commands_worker, args=(base_dir, commands), daemon=True)
         self.worker_thread.start()
 
