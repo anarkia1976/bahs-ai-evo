@@ -654,11 +654,12 @@ class BahsGuiApp(BaseWindow):
         ])
         return fonts[0] if fonts else None
 
-    def _find_extra_music(self, extra_dir: Path) -> Path | None:
-        if not extra_dir.is_dir():
+    def _find_extra_music(self, base_dir: Path) -> Path | None:
+        music_dir = base_dir / "MUSIC"
+        if not music_dir.is_dir():
             return None
         tracks = sorted([
-            p for p in extra_dir.iterdir()
+            p for p in music_dir.iterdir()
             if p.is_file() and p.suffix.lower() in MUSIC_EXTS and p.stat().st_size > 0
         ])
         return tracks[0] if tracks else None
@@ -669,7 +670,7 @@ class BahsGuiApp(BaseWindow):
 
         logo_file = self._find_extra_logo(root)
         font_file = self._find_extra_font(extra_dir)
-        music_file = self._find_extra_music(extra_dir)
+        music_file = self._find_extra_music(root)
 
         if hasattr(self, "asset_logo_lbl"):
             self.asset_logo_lbl.configure(text=f"Attuale: {logo_file.name}" if logo_file else "Attuale: nessuno")
@@ -700,8 +701,7 @@ class BahsGuiApp(BaseWindow):
         root = Path(self.base_dir_var.get().strip() or ".").resolve()
         ensure_project_dirs(root, include_model_dir=True)
         extra_dir = root / "EXTRA"
-        backup_dir = extra_dir / "BACKUP"
-        extra_dir.mkdir(parents=True, exist_ok=True)
+        music_dir = root / "MUSIC"
 
         if kind == "logo":
             filetypes = [
@@ -733,6 +733,8 @@ class BahsGuiApp(BaseWindow):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         if kind == "logo":
+            extra_dir.mkdir(parents=True, exist_ok=True)
+            backup_dir = extra_dir / "BACKUP"
             existing_logos = [
                 p for p in extra_dir.iterdir()
                 if p.is_file() and (p.stem.lower() == "logo" or p.suffix.lower() in LOGO_EXTS)
@@ -742,27 +744,32 @@ class BahsGuiApp(BaseWindow):
             target_path = extra_dir / f"logo{ext}"
             shutil.copy2(str(src_path), str(target_path))
             self._refresh_extra_logo()
+            self._refresh_extra_assets_status()
+            if moved:
+                self._append_log(f"[EXTRA] Backup in EXTRA/BACKUP/: {', '.join(moved)}\n")
+            self._append_log(f"[EXTRA] Caricato {kind}: {target_path.name}\n")
         elif kind == "font":
-            existing_fonts = [
-                p for p in extra_dir.iterdir()
-                if p.is_file() and p.suffix.lower() in FONT_EXTS
-            ]
-            moved = self._backup_existing_files(backup_dir, existing_fonts, stamp)
+            extra_dir.mkdir(parents=True, exist_ok=True)
             target_path = extra_dir / src_path.name
             shutil.copy2(str(src_path), str(target_path))
+            self._refresh_extra_assets_status()
+            self._append_log(f"[EXTRA] Caricato {kind}: {target_path.name}\n")
         else:
-            existing_music = [
-                p for p in extra_dir.iterdir()
-                if p.is_file() and p.suffix.lower() in MUSIC_EXTS
-            ]
-            moved = self._backup_existing_files(backup_dir, existing_music, stamp)
-            target_path = extra_dir / src_path.name
+            music_dir.mkdir(parents=True, exist_ok=True)
+            removed_mp3: list[str] = []
+            for p in music_dir.iterdir():
+                if p.is_file() and p.suffix.lower() == ".mp3":
+                    try:
+                        p.unlink()
+                        removed_mp3.append(p.name)
+                    except Exception as exc:
+                        self._append_log(f"[MUSIC][WARN] Impossibile rimuovere {p.name}: {exc}\n")
+            target_path = music_dir / src_path.name
             shutil.copy2(str(src_path), str(target_path))
-
-        self._refresh_extra_assets_status()
-        if moved:
-            self._append_log(f"[EXTRA] Backup in EXTRA/BACKUP/: {', '.join(moved)}\n")
-        self._append_log(f"[EXTRA] Caricato {kind}: {target_path.name}\n")
+            self._refresh_extra_assets_status()
+            if removed_mp3:
+                self._append_log(f"[MUSIC] Rimossi file .mp3 precedenti: {', '.join(removed_mp3)}\n")
+            self._append_log(f"[MUSIC] Caricato {kind}: {target_path.name}\n")
 
     def _refresh_extra_logo(self) -> None:
         root = Path(self.base_dir_var.get().strip() or ".").resolve()
@@ -1219,7 +1226,7 @@ class BahsGuiApp(BaseWindow):
                 "FN",
                 "#a855f7",
                 "Font Overlay Testo",
-                "Copia il font in EXTRA/ e sposta i font precedenti in EXTRA/BACKUP/ con data_ora",
+                "Copia il font in EXTRA/ senza creare backup",
                 "asset_font_lbl",
             ),
             (
@@ -1227,7 +1234,7 @@ class BahsGuiApp(BaseWindow):
                 "MS",
                 "#ec4899",
                 "Musica di Sottofondo",
-                "Copia la traccia audio in EXTRA/ e sposta le tracce precedenti in EXTRA/BACKUP/ con data_ora",
+                "Copia la traccia audio in MUSIC/ eliminando solo eventuali file .mp3 precedenti",
                 "asset_music_lbl",
             ),
         ]
@@ -1295,6 +1302,7 @@ class BahsGuiApp(BaseWindow):
         root = Path(self.base_dir_var.get().strip() or ".").resolve()
         ensure_project_dirs(root, include_model_dir=True)
         (root / "EXTRA" / "BACKUP").mkdir(parents=True, exist_ok=True)
+        (root / "MUSIC").mkdir(parents=True, exist_ok=True)
         self._refresh_in_videos_status()
         self._refresh_extra_logo()
         self._refresh_extra_assets_status()
