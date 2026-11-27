@@ -32,11 +32,34 @@ from bahs_core import (
 )
 
 SCRIPT_NAME = "05_BAHS_convert-clips-REEL"
+DEFAULT_IMGSZ = 960
 COCO_SPORTS_BALL_CLASS = 32
 BALL_KEYWORDS = ("sports ball", "basketball", "ball")
 UNIFORM_CLIP_RE = re.compile(r"^.+_(?:1080P|REEL)_clip_\d{2}_(?:\d{1,2}-)?\d{1,2}-\d{2}\.mp4$", re.IGNORECASE)
 LEGACY_CLIP_RE = re.compile(r"^canestro_\d{2}_(?:\d{1,2}-)?\d{1,2}-\d{2}(?:_[A-Za-z0-9_-]+)?\.mp4$", re.IGNORECASE)
 TIMESTAMP_SUFFIX_RE = re.compile(r"_(?:\d{1,2}-)?\d{1,2}-\d{2}(?:_[A-Za-z0-9_-]+)?$", re.IGNORECASE)
+
+
+def resolve_imgsz_arg(raw_imgsz: str | int | None, fallback_imgsz: int = DEFAULT_IMGSZ, logger: logging.Logger | None = None) -> int:
+    default_val = max(32, int(fallback_imgsz))
+    if raw_imgsz is None:
+        return default_val
+    txt = str(raw_imgsz).strip().lower()
+    if not txt or txt in {"auto", "default", "none"}:
+        return default_val
+    try:
+        val = int(float(txt))
+    except ValueError:
+        if logger:
+            logger.warning(f"[{SCRIPT_NAME}][IMGSZ] Valore '{raw_imgsz}' non valido, uso default {default_val}.")
+        return default_val
+    if val < 32:
+        if logger:
+            logger.warning(f"[{SCRIPT_NAME}][IMGSZ] Valore {val} < 32 non valido, uso default {default_val}.")
+        return default_val
+    if val % 32 != 0 and logger:
+        logger.info(f"[{SCRIPT_NAME}][IMGSZ] Impostato a {val} (multipli di 32 sono in genere più efficienti).")
+    return val
 
 
 def short_clip_name(clip_path: Path, tipo_slug: str) -> str:
@@ -617,6 +640,7 @@ def main() -> None:
     parser.add_argument("--conf", type=float, default=0.50)
     parser.add_argument("--alpha", type=float, default=0.25)
     parser.add_argument("--gap-frames", type=int, default=35)
+    parser.add_argument("--imgsz", default=str(DEFAULT_IMGSZ), help="Risoluzione inferenza YOLO (default 960)")
     parser.add_argument("--auto", action="store_true")
     args = parser.parse_args()
 
@@ -625,7 +649,7 @@ def main() -> None:
     logger, log_file = setup_step_logger(dirs["log"], SCRIPT_NAME)
     gpu_info = detect_gpu_and_encoder(args.device, logger)
     res = compute_system_resources()
-    imgsz = res["imgsz_default"]
+    imgsz = resolve_imgsz_arg(args.imgsz, fallback_imgsz=DEFAULT_IMGSZ, logger=logger)
     tipo_slug = sanitize_slug(args.tipo)
     _ = normalize_format(args.formato)
 

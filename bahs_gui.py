@@ -182,6 +182,7 @@ class BahsGuiApp(BaseWindow):
         self.conf_var = tk.StringVar(value="0.50")
         self.alpha_var = tk.StringVar(value="0.25")
         self.gap_var = tk.StringVar(value="35")
+        self.imgsz_var = tk.StringVar(value="960")
         self.no_fade_var = tk.BooleanVar(value=False)
         self.duration_var = tk.StringVar(value="15.0")
 
@@ -446,8 +447,9 @@ class BahsGuiApp(BaseWindow):
         )
 
     def _build_adv_step_header(self, parent: ttk.Frame, code: str, color: str, title: str, desc: str) -> ttk.Frame:
+        has_desc = bool(desc and desc.strip())
         header = ttk.Frame(parent)
-        header.pack(fill=X, pady=(0, 8))
+        header.pack(fill=X, pady=(0, 8 if has_desc else 0))
 
         badge = self._make_step_badge(header, code, color)
         badge.pack(side=LEFT, padx=(0, 10))
@@ -457,17 +459,36 @@ class BahsGuiApp(BaseWindow):
 
         ttk.Label(text_col, text=title, font=("Segoe UI", 10, "bold")).pack(anchor=W)
 
-        desc_color = "#9aa5b4" if HAS_TTKB else "#666666"
-        tk.Label(
-            text_col,
-            text=desc,
-            font=("Segoe UI", 8),
-            fg=desc_color,
-            bg="#22252a" if HAS_TTKB else text_col.cget("background"),
-            anchor=W,
-        ).pack(anchor=W)
+        if has_desc:
+            desc_color = "#9aa5b4" if HAS_TTKB else "#666666"
+            tk.Label(
+                text_col,
+                text=desc,
+                font=("Segoe UI", 8),
+                fg=desc_color,
+                bg="#22252a" if HAS_TTKB else text_col.cget("background"),
+                anchor=W,
+            ).pack(anchor=W)
 
         return header
+
+    def _add_param_guide(self, parent: ttk.Frame, items: list[tuple[str, str, str]]) -> None:
+        guide_frame = ttk.Frame(parent)
+        guide_frame.pack(fill=X, padx=(44, 0), pady=(8, 0))
+        fg_col = "#9aa5b4" if HAS_TTKB else "#555555"
+        bg_col = "#22252a" if HAS_TTKB else guide_frame.cget("background")
+        for label, desc, allowed in items:
+            line = tk.Label(
+                guide_frame,
+                text=f"• {label}: {desc}  [Range/Valori: {allowed}]",
+                font=("Segoe UI", 8),
+                fg=fg_col,
+                bg=bg_col,
+                anchor=W,
+                justify=LEFT,
+                wraplength=920,
+            )
+            line.pack(anchor=W, pady=1)
 
     def _list_in_videos(self, base_dir: Path) -> list[Path]:
         in_dir = base_dir / "IN"
@@ -1133,6 +1154,9 @@ class BahsGuiApp(BaseWindow):
             state="readonly",
             width=8,
         ).pack(side=LEFT, padx=(6, 0))
+        self._add_param_guide(ts_box, [
+            ("Velocità riproduzione", "Moltiplica la velocità del player OpenCV durante la marcatura dei timestamp", "1.0, 2.0, 4.0"),
+        ])
 
         split_box = ttk.LabelFrame(parent, padding=10)
         split_box.pack(fill=X, pady=(0, 10))
@@ -1149,6 +1173,10 @@ class BahsGuiApp(BaseWindow):
         ttk.Entry(split_ctrls, textvariable=self.before_var, width=8).pack(side=LEFT, padx=(6, 18))
         ttk.Label(split_ctrls, text="Dopo (s):").pack(side=LEFT)
         ttk.Entry(split_ctrls, textvariable=self.after_var, width=8).pack(side=LEFT, padx=(6, 0))
+        self._add_param_guide(split_box, [
+            ("Prima (s)", "Secondi di anticipo rispetto al timestamp salvato (clamped a 0.0s)", ">= 0.0 (es. 0.0 - 15.0, default 3.0)"),
+            ("Dopo (s)", "Secondi di coda dopo il timestamp salvato per formare la durata totale della clip", "> 0.0 (es. 1.0 - 20.0, default 3.0)"),
+        ])
 
         yolo_box = ttk.LabelFrame(parent, padding=10)
         yolo_box.pack(fill=X, pady=(0, 10))
@@ -1157,20 +1185,35 @@ class BahsGuiApp(BaseWindow):
             "05",
             "#a855f7",
             "Converti REEL (YOLO)",
-            "Modello, dispositivo, soglie e smoothing per il crop dinamico 9:16",
+            "Modello, dispositivo, soglie, risoluzione inferenza e smoothing per il crop dinamico 9:16",
         )
         yolo_ctrls = ttk.Frame(yolo_box)
         yolo_ctrls.pack(fill=X, padx=(44, 0))
         ttk.Label(yolo_ctrls, text="Modello:").pack(side=LEFT)
-        ttk.Entry(yolo_ctrls, textvariable=self.model_var, width=16).pack(side=LEFT, padx=(6, 14))
+        ttk.Entry(yolo_ctrls, textvariable=self.model_var, width=14).pack(side=LEFT, padx=(6, 12))
         ttk.Label(yolo_ctrls, text="Device:").pack(side=LEFT)
-        ttk.Entry(yolo_ctrls, textvariable=self.device_var, width=10).pack(side=LEFT, padx=(6, 14))
+        ttk.Entry(yolo_ctrls, textvariable=self.device_var, width=9).pack(side=LEFT, padx=(6, 12))
         ttk.Label(yolo_ctrls, text="Conf:").pack(side=LEFT)
-        ttk.Entry(yolo_ctrls, textvariable=self.conf_var, width=6).pack(side=LEFT, padx=(6, 14))
+        ttk.Entry(yolo_ctrls, textvariable=self.conf_var, width=6).pack(side=LEFT, padx=(6, 12))
         ttk.Label(yolo_ctrls, text="Alpha:").pack(side=LEFT)
-        ttk.Entry(yolo_ctrls, textvariable=self.alpha_var, width=6).pack(side=LEFT, padx=(6, 14))
+        ttk.Entry(yolo_ctrls, textvariable=self.alpha_var, width=6).pack(side=LEFT, padx=(6, 12))
         ttk.Label(yolo_ctrls, text="Gap:").pack(side=LEFT)
-        ttk.Entry(yolo_ctrls, textvariable=self.gap_var, width=6).pack(side=LEFT, padx=(6, 0))
+        ttk.Entry(yolo_ctrls, textvariable=self.gap_var, width=6).pack(side=LEFT, padx=(6, 12))
+        ttk.Label(yolo_ctrls, text="Imgsz:").pack(side=LEFT)
+        ttk.Combobox(
+            yolo_ctrls,
+            textvariable=self.imgsz_var,
+            values=["960", "640", "1280", "auto"],
+            width=8,
+        ).pack(side=LEFT, padx=(6, 0))
+        self._add_param_guide(yolo_box, [
+            ("Modello", "File pesi o nome modello YOLO cercato/scaricato in EXTRA/MODEL/", ".pt, .onnx, .engine, .tflite, .pb (es. yolo26l.pt)"),
+            ("Device", "Dispositivo di inferenza YOLO (con fallback automatico su CPU se non disponibile)", "auto, cpu, cuda:0, 0, 0,1"),
+            ("Conf", "Soglia minima di confidenza per accettare una rilevazione del pallone", "0.01 - 1.00 (default 0.50)"),
+            ("Alpha", "Controlla la fluidità del movimento camera (mappato su finestra 0.20s - 1.20s)", ">= 0.0 (es. 0.05 - 1.00, default 0.25)"),
+            ("Gap", "Numero massimo di frame consecutivi senza rilevazione interpolati linearmente", "intero >= 1 (es. 5 - 120, default 35)"),
+            ("Imgsz", "Risoluzione di inferenza YOLO usata per il rilevamento del pallone", "intero >= 32 (consigliato multiplo di 32: 320 - 1920, default 960; opzionale 'auto')"),
+        ])
 
         merge_box = ttk.LabelFrame(parent, padding=10)
         merge_box.pack(fill=X, pady=(0, 10))
@@ -1196,6 +1239,9 @@ class BahsGuiApp(BaseWindow):
                 text="Disattiva fade tra clip (06 --no-fade)",
                 variable=self.no_fade_var,
             ).pack(side=LEFT)
+        self._add_param_guide(merge_box, [
+            ("Disattiva fade", "Se attivo, unisce le clip in concat diretto senza transizioni xfade/acrossfade", "True / False (default False)"),
+        ])
 
         overlay_box = ttk.LabelFrame(parent, padding=10)
         overlay_box.pack(fill=X)
@@ -1210,45 +1256,37 @@ class BahsGuiApp(BaseWindow):
         overlay_ctrls.pack(fill=X, padx=(44, 0))
         ttk.Label(overlay_ctrls, text="Durata testo (s):").pack(side=LEFT)
         ttk.Entry(overlay_ctrls, textvariable=self.duration_var, width=8).pack(side=LEFT, padx=(6, 0))
+        self._add_param_guide(overlay_box, [
+            ("Durata testo (s)", "Secondi di visualizzazione del titolo e del sottotitolo dall'inizio del video", "> 0.0 (es. 3.0 - 60.0, default 15.0)"),
+        ])
 
     def _build_assets_tab(self, parent: ttk.Frame) -> None:
         specs = [
-            (
-                "logo",
-                "LG",
-                "#06b6d4",
-                "Logo Squadra / Evento",
-                "Salva in EXTRA/logo.<ext> e sposta i logo precedenti in EXTRA/BACKUP/ con data_ora",
-                "asset_logo_lbl",
-            ),
-            (
-                "font",
-                "FN",
-                "#a855f7",
-                "Font Overlay Testo",
-                "Copia il font in EXTRA/ senza creare backup",
-                "asset_font_lbl",
-            ),
-            (
-                "music",
-                "MS",
-                "#ec4899",
-                "Musica di Sottofondo",
-                "Copia la traccia audio in MUSIC/ eliminando solo eventuali file .mp3 precedenti",
-                "asset_music_lbl",
-            ),
+            ("logo", "LG", "#06b6d4", "Logo Squadra / Evento", "asset_logo_lbl"),
+            ("font", "FN", "#a855f7", "Font Overlay Testo", "asset_font_lbl"),
+            ("music", "MS", "#ec4899", "Musica di Sottofondo", "asset_music_lbl"),
         ]
 
-        for kind, code, color, title, desc, attr_name in specs:
-            box = ttk.LabelFrame(parent, padding=10)
-            box.pack(fill=X, pady=(0, 10))
-            self._build_adv_step_header(box, code, color, title, desc)
+        muted_color = "#9aa5b4" if HAS_TTKB else "#666666"
+
+        for kind, code, color, title, attr_name in specs:
+            box = ttk.LabelFrame(parent, padding=(12, 8))
+            box.pack(fill=X, pady=(0, 8))
 
             row = ttk.Frame(box)
-            row.pack(fill=X, padx=(44, 0))
+            row.pack(fill=X)
 
-            status_lbl = ttk.Label(row, text="Attuale: -", font=("Segoe UI", 9))
-            status_lbl.pack(side=LEFT, fill=X, expand=True)
+            badge = self._make_step_badge(row, code, color)
+            badge.pack(side=LEFT, padx=(0, 12))
+
+            info_col = ttk.Frame(row)
+            info_col.pack(side=LEFT, fill=X, expand=True)
+
+            ttk.Label(info_col, text=title, font=("Segoe UI", 10, "bold")).pack(anchor=W)
+
+            status_lbl = ttk.Label(info_col, text="Attuale: -", font=("Segoe UI", 9))
+            status_lbl.configure(foreground=muted_color)
+            status_lbl.pack(anchor=W, pady=(2, 0))
             setattr(self, attr_name, status_lbl)
 
             self._btn(
@@ -1256,7 +1294,7 @@ class BahsGuiApp(BaseWindow):
                 "Carica...",
                 command=lambda k=kind: self._install_custom_asset(k),
                 bootstyle="info-outline",
-            ).pack(side=RIGHT)
+            ).pack(side=RIGHT, padx=(12, 0))
 
         self._refresh_extra_assets_status()
 
@@ -1389,6 +1427,7 @@ class BahsGuiApp(BaseWindow):
                 "--conf", self.conf_var.get().strip() or "0.50",
                 "--alpha", self.alpha_var.get().strip() or "0.25",
                 "--gap-frames", self.gap_var.get().strip() or "35",
+                "--imgsz", self.imgsz_var.get().strip() or "960",
             ])
         elif script_name == "06_BAHS_merge-clips-ALL.py" and self.no_fade_var.get():
             cmd.append("--no-fade")
