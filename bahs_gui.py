@@ -186,12 +186,14 @@ class BahsGuiApp(BaseWindow):
         self.duration_var = tk.StringVar(value="15.0")
 
         self.log_queue: queue.Queue[str] = queue.Queue()
-        self.status_queue: queue.Queue[str] = queue.Queue()
+        self.status_queue: queue.Queue[tuple[str, int | None, int | None]] = queue.Queue()
         self.current_proc: subprocess.Popen | None = None
         self.worker_thread: threading.Thread | None = None
         self.stop_requested = False
 
         self.status_state = "pronto"
+        self.status_current_step: int | None = None
+        self.status_total_steps: int | None = None
         self._pulse_phase = 0.0
         self._blink_after_id: str | None = None
 
@@ -325,10 +327,30 @@ class BahsGuiApp(BaseWindow):
             pass
         return "#f0f0f0"
 
-    def _set_status_state(self, state: str) -> None:
+    def _format_status_label(
+        self,
+        state: str,
+        current_step: int | None = None,
+        total_steps: int | None = None,
+    ) -> str:
+        base_label = STATUS_STYLES.get(state, STATUS_STYLES["pronto"])["label"]
+        if current_step is not None and total_steps is not None and total_steps > 0:
+            return f"{base_label} · Step {current_step}/{total_steps}"
+        if total_steps is not None and total_steps > 0:
+            return f"{base_label} · {total_steps} step"
+        return base_label
+
+    def _set_status_state(
+        self,
+        state: str,
+        current_step: int | None = None,
+        total_steps: int | None = None,
+    ) -> None:
         if state not in STATUS_STYLES:
             state = "pronto"
         self.status_state = state
+        self.status_current_step = current_step
+        self.status_total_steps = total_steps
         self._pulse_phase = 0.0
 
         if self._blink_after_id is not None:
@@ -340,7 +362,9 @@ class BahsGuiApp(BaseWindow):
 
         info = STATUS_STYLES[state]
         if hasattr(self, "status_text_lbl"):
-            self.status_text_lbl.configure(text=info["label"])
+            self.status_text_lbl.configure(
+                text=self._format_status_label(state, current_step, total_steps)
+            )
 
         self._redraw_status_circle(intensity=1.0)
 
@@ -374,7 +398,7 @@ class BahsGuiApp(BaseWindow):
         self.status_canvas.configure(bg=bg)
         self.status_canvas.delete("all")
 
-        cx, cy = 10.0, 10.0
+        cx, cy = 11.0, 11.0
         bezel_outer = "#0f172a" if HAS_TTKB else "#94a3b8"
         bezel_inner = "#334155" if HAS_TTKB else "#cbd5e1"
         off_base = "#1e293b" if HAS_TTKB else "#cbd5e1"
@@ -382,8 +406,8 @@ class BahsGuiApp(BaseWindow):
         if info["pulse"] and intensity > 0.2:
             glow_outer = _blend_hex(bg, info["glow"], 0.24 * intensity)
             glow_mid = _blend_hex(bg, info["glow"], 0.45 * intensity)
-            r_glow1 = 9.0 + 0.8 * intensity
-            r_glow2 = 8.1 + 0.5 * intensity
+            r_glow1 = 10.0 + 0.8 * intensity
+            r_glow2 = 9.0 + 0.5 * intensity
             self.status_canvas.create_oval(
                 cx - r_glow1, cy - r_glow1, cx + r_glow1, cy + r_glow1,
                 fill=glow_outer, outline=""
@@ -394,7 +418,7 @@ class BahsGuiApp(BaseWindow):
             )
 
         self.status_canvas.create_oval(
-            cx - 7.6, cy - 7.6, cx + 7.6, cy + 7.6,
+            cx - 8.4, cy - 8.4, cx + 8.4, cy + 8.4,
             fill=bezel_outer, outline=bezel_inner, width=1
         )
 
@@ -403,21 +427,21 @@ class BahsGuiApp(BaseWindow):
         hot_col = _blend_hex(mid_col, info["light"], 0.45 * intensity)
 
         self.status_canvas.create_oval(
-            cx - 6.1, cy - 6.1, cx + 6.1, cy + 6.1,
+            cx - 6.7, cy - 6.7, cx + 6.7, cy + 6.7,
             fill=rim_col, outline=""
         )
         self.status_canvas.create_oval(
-            cx - 5.0, cy - 5.0, cx + 5.0, cy + 5.0,
+            cx - 5.5, cy - 5.5, cx + 5.5, cy + 5.5,
             fill=mid_col, outline=""
         )
         self.status_canvas.create_oval(
-            cx - 3.4, cy - 3.5, cx + 2.8, cy + 2.7,
+            cx - 3.8, cy - 3.9, cx + 3.1, cy + 3.0,
             fill=hot_col, outline=""
         )
 
         spec_col = _blend_hex(hot_col, "#ffffff", 0.35 + 0.50 * intensity)
         self.status_canvas.create_oval(
-            cx - 3.6, cy - 3.7, cx - 1.0, cy - 1.3,
+            cx - 4.0, cy - 4.1, cx - 1.1, cy - 1.4,
             fill=spec_col, outline=""
         )
 
@@ -778,7 +802,7 @@ class BahsGuiApp(BaseWindow):
         canvas.bind("<Configure>", _on_canvas_configure)
 
         def _on_mousewheel(event):
-            if event.state & 0x0001:  # Shift per scroll orizzontale
+            if event.state & 0x0001:
                 delta = -1 if event.delta > 0 else 1
                 canvas.xview_scroll(delta, "units")
             else:
@@ -819,8 +843,7 @@ class BahsGuiApp(BaseWindow):
         ttk.Label(row_dir, text="Cartella Base:").pack(side=LEFT, padx=(0, 8))
         ttk.Entry(row_dir, textvariable=self.base_dir_var).pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
         self._btn(row_dir, "Sfoglia...", self._choose_base_dir, bootstyle="info-outline").pack(side=LEFT, padx=(0, 6))
-        self._btn(row_dir, "Crea Cartelle", self._init_dirs, bootstyle="secondary-outline").pack(side=LEFT, padx=(0, 6))
-        self._btn(row_dir, "🧹 Pulisci Cartelle", self._clean_workspace_dirs, bootstyle="warning-outline").pack(side=LEFT)
+        self._btn(row_dir, "Crea Cartelle", self._init_dirs, bootstyle="secondary-outline").pack(side=LEFT)
 
         self.sys_label = ttk.Label(left_info, text="")
         self.sys_label.pack(anchor=W, pady=(8, 0))
@@ -883,30 +906,18 @@ class BahsGuiApp(BaseWindow):
         self._btn(action_bar, "📂 FINAL/", lambda: self._open_folder("FINAL"), bootstyle="info-outline").pack(side=LEFT, padx=(0, 6))
         self._btn(action_bar, "📂 OUT/", lambda: self._open_folder("OUT"), bootstyle="secondary-outline").pack(side=LEFT, padx=(0, 6))
         self._btn(action_bar, "📂 LOG/", lambda: self._open_folder("LOG"), bootstyle="secondary-outline").pack(side=LEFT, padx=(0, 6))
+        self._btn(action_bar, "🧹 Pulisci Log", self._clear_log, bootstyle="warning-outline").pack(side=LEFT, padx=(0, 6))
+        self._btn(action_bar, "🧹 Pulisci Cartelle", self._clean_workspace_dirs, bootstyle="warning-outline").pack(side=LEFT)
 
-        btn_clear_log = self._btn(action_bar, "🧹 Pulisci Log", self._clear_log, bootstyle="warning-outline")
-        btn_clear_log.pack(side=RIGHT)
-
-        # Box di stato visibile e allineato a "Pulisci Log"
-        border_col = "#f59e0b"
+        # Pallino LED e testo di stato (con step corrente / totale) a destra
         panel_bg = self._get_panel_bg(action_bar)
-        status_box = tk.Frame(
-            action_bar,
-            bg=panel_bg,
-            highlightbackground=border_col,
-            highlightcolor=border_col,
-            highlightthickness=1,
-            bd=0,
-        )
-        status_box.pack(side=RIGHT, padx=(0, 8))
-
-        status_inner = tk.Frame(status_box, bg=panel_bg, padx=9, pady=4)
-        status_inner.pack(side=LEFT)
+        status_holder = tk.Frame(action_bar, bg=panel_bg, bd=0, highlightthickness=0)
+        status_holder.pack(side=RIGHT, padx=(8, 2))
 
         self.status_canvas = tk.Canvas(
-            status_inner,
-            width=20,
-            height=20,
+            status_holder,
+            width=22,
+            height=22,
             bg=panel_bg,
             highlightthickness=0,
             bd=0,
@@ -914,10 +925,10 @@ class BahsGuiApp(BaseWindow):
         self.status_canvas.pack(side=LEFT, padx=(0, 6))
 
         self.status_text_lbl = tk.Label(
-            status_inner,
+            status_holder,
             text="Pronto",
             font=("Segoe UI", 9, "bold"),
-            fg="#f59e0b" if HAS_TTKB else "#b45309",
+            fg="#e6edf3" if HAS_TTKB else "#222222",
             bg=panel_bg,
         )
         self.status_text_lbl.pack(side=LEFT)
@@ -1249,8 +1260,13 @@ class BahsGuiApp(BaseWindow):
     def _append_log(self, text: str) -> None:
         self.log_queue.put(text)
 
-    def _set_status_from_worker(self, state: str) -> None:
-        self.status_queue.put(state)
+    def _set_status_from_worker(
+        self,
+        state: str,
+        current_step: int | None = None,
+        total_steps: int | None = None,
+    ) -> None:
+        self.status_queue.put((state, current_step, total_steps))
 
     def _poll_log_queue(self) -> None:
         while True:
@@ -1265,10 +1281,10 @@ class BahsGuiApp(BaseWindow):
 
         while True:
             try:
-                next_state = self.status_queue.get_nowait()
+                next_state, cur_step, tot_steps = self.status_queue.get_nowait()
             except queue.Empty:
                 break
-            self._set_status_state(next_state)
+            self._set_status_state(next_state, current_step=cur_step, total_steps=tot_steps)
 
         self.after(80, self._poll_log_queue)
 
@@ -1335,21 +1351,27 @@ class BahsGuiApp(BaseWindow):
 
     def _run_commands_worker(self, base_dir: Path, commands: list[tuple[str, list[str]]]) -> None:
         self.stop_requested = False
+        total_steps = len(commands)
         final_state = "terminato"
+        final_step: int | None = total_steps if total_steps > 0 else None
         try:
-            for script_name, cmd in commands:
+            for idx, (script_name, cmd) in enumerate(commands, start=1):
                 if self.stop_requested:
                     self._append_log("\n[GUI] Esecuzione interrotta dall'utente.\n")
                     final_state = "errore"
+                    final_step = idx
                     break
+
+                self._set_status_from_worker("in_corso", current_step=idx, total_steps=total_steps)
 
                 script_path = base_dir / script_name
                 if not script_path.is_file():
                     self._append_log(f"\n[GUI][ERRORE] Script non trovato: {script_path}\n")
                     final_state = "errore"
+                    final_step = idx
                     break
 
-                self._append_log(f"\n=== Avvio {script_name} ===\n")
+                self._append_log(f"\n=== Avvio {script_name} (Step {idx}/{total_steps}) ===\n")
 
                 is_interactive_03 = script_name == "03_BAHS_identify-timestamps-ALL.py"
                 if is_interactive_03 and os.name == "nt":
@@ -1381,18 +1403,21 @@ class BahsGuiApp(BaseWindow):
                 if self.stop_requested:
                     self._append_log("\n[GUI] Processo terminato su richiesta.\n")
                     final_state = "errore"
+                    final_step = idx
                     break
                 if rc != 0:
                     self._append_log(f"\n[GUI][ERRORE] {script_name} terminato con codice {rc}. Pipeline fermata.\n")
                     final_state = "errore"
+                    final_step = idx
                     break
-                self._append_log(f"=== Completato {script_name} ===\n")
+                self._append_log(f"=== Completato {script_name} (Step {idx}/{total_steps}) ===\n")
         except Exception as exc:
             self._append_log(f"\n[GUI][ERRORE] Eccezione imprevista: {exc}\n")
             final_state = "errore"
+            final_step = self.status_current_step
         finally:
             self.current_proc = None
-            self._set_status_from_worker(final_state)
+            self._set_status_from_worker(final_state, current_step=final_step, total_steps=total_steps)
             self.after(0, self._on_worker_finished)
 
     def _on_worker_finished(self) -> None:
@@ -1408,9 +1433,10 @@ class BahsGuiApp(BaseWindow):
         base_dir = Path(self.base_dir_var.get().strip() or ".").resolve()
         ensure_project_dirs(base_dir, include_model_dir=True)
 
+        total_steps = len(commands)
         self.btn_run_all.configure(state=DISABLED)
         self.btn_stop.configure(state=NORMAL)
-        self._set_status_state("in_corso")
+        self._set_status_state("in_corso", current_step=1 if total_steps > 0 else None, total_steps=total_steps)
         self.worker_thread = threading.Thread(target=self._run_commands_worker, args=(base_dir, commands), daemon=True)
         self.worker_thread.start()
 
