@@ -783,31 +783,67 @@ class BahsGuiApp(BaseWindow):
         canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
 
         canvas.grid(row=0, column=0, sticky="nsew")
-        v_scroll.grid(row=0, column=1, sticky=NS)
-        h_scroll.grid(row=1, column=0, sticky=EW)
         wrapper.rowconfigure(0, weight=1)
         wrapper.columnconfigure(0, weight=1)
 
         inner = ttk.Frame(canvas)
         win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
 
-        def _on_inner_configure(_event=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
+        scroll_state = {"needs_v": False, "needs_h": False}
 
-        def _on_canvas_configure(event):
+        def _sync_scrollbars(_event=None):
             req_w = inner.winfo_reqwidth()
-            canvas.itemconfigure(win_id, width=max(event.width, req_w))
+            req_h = inner.winfo_reqheight()
+            vis_w = max(1, canvas.winfo_width())
+            vis_h = max(1, canvas.winfo_height())
 
-        inner.bind("<Configure>", _on_inner_configure)
-        canvas.bind("<Configure>", _on_canvas_configure)
+            target_w = max(vis_w, req_w)
+            target_h = max(vis_h, req_h)
+            canvas.itemconfigure(win_id, width=target_w, height=target_h)
+            canvas.configure(scrollregion=(0, 0, target_w, target_h))
+
+            needs_v = req_h > vis_h + 1
+            needs_h = req_w > vis_w + 1
+            scroll_state["needs_v"] = needs_v
+            scroll_state["needs_h"] = needs_h
+
+            if needs_v:
+                v_scroll.grid(row=0, column=1, sticky=NS)
+            else:
+                v_scroll.grid_remove()
+                canvas.yview_moveto(0.0)
+
+            if needs_h:
+                h_scroll.grid(row=1, column=0, sticky=EW)
+            else:
+                h_scroll.grid_remove()
+                canvas.xview_moveto(0.0)
+
+        inner.bind("<Configure>", _sync_scrollbars)
+        canvas.bind("<Configure>", _sync_scrollbars)
+
+        def _is_inside_log_widget(widget) -> bool:
+            if not hasattr(self, "log_text"):
+                return False
+            cur = widget
+            while cur is not None:
+                if cur == self.log_text:
+                    return True
+                cur = getattr(cur, "master", None)
+            return False
 
         def _on_mousewheel(event):
+            if _is_inside_log_widget(event.widget):
+                return
+            delta = -1 if event.delta > 0 else 1
             if event.state & 0x0001:
-                delta = -1 if event.delta > 0 else 1
-                canvas.xview_scroll(delta, "units")
+                if scroll_state["needs_h"]:
+                    canvas.xview_scroll(delta, "units")
+                    return "break"
             else:
-                delta = -1 if event.delta > 0 else 1
-                canvas.yview_scroll(delta, "units")
+                if scroll_state["needs_v"]:
+                    canvas.yview_scroll(delta, "units")
+                    return "break"
 
         def _bind_wheel(_e):
             canvas.bind_all("<MouseWheel>", _on_mousewheel)
