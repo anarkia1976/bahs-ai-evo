@@ -25,6 +25,13 @@ try:
 except ImportError:
     HAS_PIL = False
 
+try:
+    from tkinter_icons import MaterialIcon
+    HAS_TK_ICONS = True
+except ImportError:
+    MaterialIcon = None
+    HAS_TK_ICONS = False
+
 from bahs_core import (
     DEFAULT_FORMAT,
     DEFAULT_SUB_TEXT,
@@ -36,6 +43,8 @@ from bahs_core import (
     has_valid_timestamps,
     normalize_format,
 )
+
+DEFAULT_ICON_PACK = "lucide"
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
 FONT_EXTS = {".ttf", ".otf", ".ttc", ".woff", ".woff2"}
@@ -167,6 +176,8 @@ class BahsGuiApp(BaseWindow):
         self.geometry("1120x860")
         self.minsize(720, 480)
 
+        self._icon_cache: dict[tuple[str, str, int, str], tk.PhotoImage] = {}
+
         self.base_dir_var = tk.StringVar(value=str(Path(__file__).resolve().parent))
         self.tipo_var = tk.StringVar(value=DEFAULT_TOP_TEXT)
         self.tipo_custom_var = tk.StringVar(value=DEFAULT_TOP_TEXT)
@@ -211,6 +222,48 @@ class BahsGuiApp(BaseWindow):
         self._refresh_extra_assets_status()
         self._poll_log_queue()
         self._apply_windows_dark_titlebar()
+
+    def _get_ui_icon(
+        self,
+        name: str,
+        color: str = "#38bdf8",
+        size: int = 16,
+        pack: str = DEFAULT_ICON_PACK,
+    ) -> tk.PhotoImage | None:
+        key = (pack, name, size, color)
+        if key in self._icon_cache:
+            return self._icon_cache[key]
+
+        img: tk.PhotoImage | None = None
+
+        if HAS_TK_ICONS and MaterialIcon is not None:
+            for candidate in (name, name.replace("_", "-"), name.replace("-", "_")):
+                try:
+                    icon_obj = MaterialIcon(candidate, size=size, color=color)
+                    img = getattr(icon_obj, "image", None)
+                    if img is not None:
+                        break
+                except Exception:
+                    img = None
+
+        if img is None and HAS_PIL:
+            try:
+                pil_img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(pil_img)
+                rgb = _hex_to_rgb(color) + (255,)
+                pad = max(2, size // 6)
+                draw.rounded_rectangle(
+                    [pad, pad, size - pad, size - pad],
+                    radius=max(2, size // 4),
+                    fill=rgb,
+                )
+                img = ImageTk.PhotoImage(pil_img)
+            except Exception:
+                img = None
+
+        if img is not None:
+            self._icon_cache[key] = img
+        return img
 
     def _build_basketball_pil_image(self, size: int = 64):
         img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -286,10 +339,26 @@ class BahsGuiApp(BaseWindow):
         except Exception:
             pass
 
-    def _btn(self, parent, text: str, command, bootstyle: str = "secondary", **kwargs):
+    def _btn(
+        self,
+        parent,
+        text: str,
+        command,
+        bootstyle: str = "secondary",
+        icon_name: str | None = None,
+        icon_color: str = "#e2e8f0",
+        icon_size: int = 15,
+        icon_pack: str = DEFAULT_ICON_PACK,
+        **kwargs,
+    ):
+        icon_img = self._get_ui_icon(icon_name, color=icon_color, size=icon_size, pack=icon_pack) if icon_name else None
+        extra = {}
+        if icon_img is not None:
+            extra["image"] = icon_img
+            extra["compound"] = LEFT
         if HAS_TTKB:
-            return ttk.Button(parent, text=text, command=command, bootstyle=bootstyle, **kwargs)
-        return ttk.Button(parent, text=text, command=command, **kwargs)
+            return ttk.Button(parent, text=text, command=command, bootstyle=bootstyle, **extra, **kwargs)
+        return ttk.Button(parent, text=text, command=command, **extra, **kwargs)
 
     def _make_step_badge(self, parent, code: str, color: str) -> tk.Canvas:
         bg_panel = "#22252a" if HAS_TTKB else parent.cget("background")
@@ -507,12 +576,18 @@ class BahsGuiApp(BaseWindow):
         count = len(videos)
         if count > 0:
             voce = "video pronto e disponibile" if count == 1 else "video pronti e disponibili"
+            icon_img = self._get_ui_icon("movie", color="#38bdf8", size=16)
             self.in_status_lbl.configure(
-                text=f"🎬 Cartella IN: {count} {voce}"
+                text=f" Cartella IN: {count} {voce}",
+                image=icon_img if icon_img else "",
+                compound=LEFT if icon_img else "none",
             )
         else:
+            icon_img = self._get_ui_icon("warning", color="#f59e0b", size=16)
             self.in_status_lbl.configure(
-                text="⚠️ Cartella IN: 0 video pronti e disponibili"
+                text=" Cartella IN: 0 video pronti e disponibili",
+                image=icon_img if icon_img else "",
+                compound=LEFT if icon_img else "none",
             )
 
     def _upload_videos_to_in(self) -> None:
@@ -924,7 +999,7 @@ class BahsGuiApp(BaseWindow):
         main_pad.pack(fill=BOTH, expand=True)
 
         # --- Cartella Progetto, Risorse & Logo EXTRA a destra ---
-        top_box = ttk.LabelFrame(main_pad, text="  📁 Progetto & Risorse di Sistema  ", padding=12)
+        top_box = ttk.LabelFrame(main_pad, text="  Progetto & Risorse di Sistema  ", padding=12)
         top_box.pack(fill=X, pady=(0, 10))
 
         top_grid = ttk.Frame(top_box)
@@ -938,19 +1013,54 @@ class BahsGuiApp(BaseWindow):
         row_dir.pack(fill=X)
         ttk.Label(row_dir, text="Cartella Base:").pack(side=LEFT, padx=(0, 8))
         ttk.Entry(row_dir, textvariable=self.base_dir_var).pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
-        self._btn(row_dir, "Sfoglia...", self._choose_base_dir, bootstyle="info-outline").pack(side=LEFT, padx=(0, 6))
-        self._btn(row_dir, "Crea Cartelle", self._init_dirs, bootstyle="secondary-outline").pack(side=LEFT)
+        self._btn(
+            row_dir,
+            "Sfoglia...",
+            self._choose_base_dir,
+            bootstyle="info-outline",
+            icon_name="folder_open",
+            icon_color="#38bdf8",
+        ).pack(side=LEFT, padx=(0, 6))
+        self._btn(
+            row_dir,
+            "Crea Cartelle",
+            self._init_dirs,
+            bootstyle="secondary-outline",
+            icon_name="create_new_folder",
+            icon_color="#94a3b8",
+        ).pack(side=LEFT)
 
         self.sys_label = ttk.Label(left_info, text="")
         self.sys_label.pack(anchor=W, pady=(8, 0))
 
         row_in = ttk.Frame(left_info)
         row_in.pack(fill=X, pady=(6, 0))
-        self.in_status_lbl = ttk.Label(row_in, text="🎬 Cartella IN: -")
+        self.in_status_lbl = ttk.Label(row_in, text="Cartella IN: -")
         self.in_status_lbl.pack(side=LEFT, fill=X, expand=True)
-        self._btn(row_in, "Carica Video in IN...", self._upload_videos_to_in, bootstyle="success-outline").pack(side=LEFT, padx=(0, 6))
-        self._btn(row_in, "Pulisci IN/", self._clear_in_folder, bootstyle="danger-outline").pack(side=LEFT, padx=(0, 6))
-        self._btn(row_in, "Aggiorna", self._refresh_in_videos_status, bootstyle="secondary-outline").pack(side=LEFT)
+        self._btn(
+            row_in,
+            "Carica Video in IN...",
+            self._upload_videos_to_in,
+            bootstyle="success-outline",
+            icon_name="upload",
+            icon_color="#22c55e",
+        ).pack(side=LEFT, padx=(0, 6))
+        self._btn(
+            row_in,
+            "Pulisci IN/",
+            self._clear_in_folder,
+            bootstyle="danger-outline",
+            icon_name="delete",
+            icon_color="#ef4444",
+        ).pack(side=LEFT, padx=(0, 6))
+        self._btn(
+            row_in,
+            "Aggiorna",
+            self._refresh_in_videos_status,
+            bootstyle="secondary-outline",
+            icon_name="refresh",
+            icon_color="#94a3b8",
+        ).pack(side=LEFT)
 
         bg_logo = "#181b20" if HAS_TTKB else top_box.cget("background")
         self.logo_preview_lbl = tk.Label(
@@ -970,9 +1080,14 @@ class BahsGuiApp(BaseWindow):
         tab_pipe = ttk.Frame(notebook, padding=12)
         tab_adv = ttk.Frame(notebook, padding=12)
         tab_assets = ttk.Frame(notebook, padding=12)
-        notebook.add(tab_pipe, text="  🏀 Pipeline & Step  ")
-        notebook.add(tab_adv, text="  ⚙️ Parametri Avanzati  ")
-        notebook.add(tab_assets, text="  🎨 Risorse Personalizzate  ")
+
+        icon_pipe = self._get_ui_icon("play_circle", color="#f97316", size=16)
+        icon_adv = self._get_ui_icon("tune", color="#38bdf8", size=16)
+        icon_assets = self._get_ui_icon("palette", color="#ec4899", size=16)
+
+        notebook.add(tab_pipe, text=" Pipeline & Step ", image=icon_pipe or "", compound=LEFT if icon_pipe else "none")
+        notebook.add(tab_adv, text=" Parametri Avanzati ", image=icon_adv or "", compound=LEFT if icon_adv else "none")
+        notebook.add(tab_assets, text=" Risorse Personalizzate ", image=icon_assets or "", compound=LEFT if icon_assets else "none")
 
         self._build_pipeline_tab(tab_pipe)
         self._build_advanced_tab(tab_adv)
@@ -984,26 +1099,65 @@ class BahsGuiApp(BaseWindow):
 
         self.btn_run_all = self._btn(
             action_bar,
-            "▶  Avvia Pipeline Completa",
+            "Avvia Pipeline Completa",
             self._start_full_pipeline,
             bootstyle="success",
+            icon_name="play_arrow",
+            icon_color="#ffffff",
         )
         self.btn_run_all.pack(side=LEFT, padx=(0, 8))
 
         self.btn_stop = self._btn(
             action_bar,
-            "■  Interrompi",
+            "Interrompi",
             self._stop_process,
             bootstyle="danger",
+            icon_name="stop",
+            icon_color="#ffffff",
         )
         self.btn_stop.configure(state=DISABLED)
         self.btn_stop.pack(side=LEFT, padx=(0, 16))
 
-        self._btn(action_bar, "📂 FINAL/", lambda: self._open_folder("FINAL"), bootstyle="info-outline").pack(side=LEFT, padx=(0, 6))
-        self._btn(action_bar, "📂 OUT/", lambda: self._open_folder("OUT"), bootstyle="secondary-outline").pack(side=LEFT, padx=(0, 6))
-        self._btn(action_bar, "📂 LOG/", lambda: self._open_folder("LOG"), bootstyle="secondary-outline").pack(side=LEFT, padx=(0, 6))
-        self._btn(action_bar, "🧹 Pulisci Log", self._clear_log, bootstyle="warning-outline").pack(side=LEFT, padx=(0, 6))
-        self._btn(action_bar, "🧹 Pulisci Cartelle", self._clean_workspace_dirs, bootstyle="warning-outline").pack(side=LEFT)
+        self._btn(
+            action_bar,
+            "FINAL/",
+            lambda: self._open_folder("FINAL"),
+            bootstyle="info-outline",
+            icon_name="folder",
+            icon_color="#38bdf8",
+        ).pack(side=LEFT, padx=(0, 6))
+        self._btn(
+            action_bar,
+            "OUT/",
+            lambda: self._open_folder("OUT"),
+            bootstyle="secondary-outline",
+            icon_name="folder",
+            icon_color="#94a3b8",
+        ).pack(side=LEFT, padx=(0, 6))
+        self._btn(
+            action_bar,
+            "LOG/",
+            lambda: self._open_folder("LOG"),
+            bootstyle="secondary-outline",
+            icon_name="description",
+            icon_color="#94a3b8",
+        ).pack(side=LEFT, padx=(0, 6))
+        self._btn(
+            action_bar,
+            "Pulisci Log",
+            self._clear_log,
+            bootstyle="warning-outline",
+            icon_name="cleaning_services",
+            icon_color="#f59e0b",
+        ).pack(side=LEFT, padx=(0, 6))
+        self._btn(
+            action_bar,
+            "Pulisci Cartelle",
+            self._clean_workspace_dirs,
+            bootstyle="warning-outline",
+            icon_name="auto_delete",
+            icon_color="#f59e0b",
+        ).pack(side=LEFT)
 
         # Pallino LED e testo di stato (con step corrente / totale) a destra
         panel_bg = self._get_panel_bg(action_bar)
@@ -1030,7 +1184,7 @@ class BahsGuiApp(BaseWindow):
         self.status_text_lbl.pack(side=LEFT)
 
         # --- Console Output Live ---
-        log_box = ttk.LabelFrame(main_pad, text="  🖥️ Output Elaborazione  ", padding=10)
+        log_box = ttk.LabelFrame(main_pad, text="  Output Elaborazione  ", padding=10)
         log_box.pack(fill=BOTH, expand=True)
 
         bg_log = "#0d1117" if HAS_TTKB else "#111111"
@@ -1058,7 +1212,7 @@ class BahsGuiApp(BaseWindow):
         log_box.columnconfigure(0, weight=1)
 
     def _build_pipeline_tab(self, parent: ttk.Frame) -> None:
-        cfg = ttk.LabelFrame(parent, text="  🎯 Parametri Incontro  ", padding=12)
+        cfg = ttk.LabelFrame(parent, text="  Parametri Incontro  ", padding=12)
         cfg.pack(fill=X, pady=(0, 12))
 
         cfg.columnconfigure(1, weight=1)
@@ -1098,7 +1252,7 @@ class BahsGuiApp(BaseWindow):
         ttk.Label(cfg, text="Sottotitolo overlay:").grid(row=1, column=2, sticky=W, pady=6)
         ttk.Entry(cfg, textvariable=self.sottotitolo_var).grid(row=1, column=3, sticky=EW, padx=(8, 0), pady=6)
 
-        steps_box = ttk.LabelFrame(parent, text="  ⚡ Esecuzione Singolo Step  ", padding=10)
+        steps_box = ttk.LabelFrame(parent, text="  Esecuzione Singolo Step  ", padding=10)
         steps_box.pack(fill=BOTH, expand=True)
 
         for idx, (script_name, code, color, title, desc, _is_interactive) in enumerate(ALL_STEP_SCRIPTS):
@@ -1129,6 +1283,9 @@ class BahsGuiApp(BaseWindow):
                 "Esegui",
                 command=lambda s=script_name: self._start_single_step(s),
                 bootstyle="primary-outline",
+                icon_name="play_arrow",
+                icon_color="#38bdf8",
+                icon_size=14,
             ).grid(row=0, column=2, rowspan=2, padx=(10, 0))
 
         steps_box.columnconfigure(0, weight=1)
@@ -1294,6 +1451,8 @@ class BahsGuiApp(BaseWindow):
                 "Carica...",
                 command=lambda k=kind: self._install_custom_asset(k),
                 bootstyle="info-outline",
+                icon_name="upload",
+                icon_color="#38bdf8",
             ).pack(side=RIGHT, padx=(12, 0))
 
         self._refresh_extra_assets_status()
@@ -1348,13 +1507,16 @@ class BahsGuiApp(BaseWindow):
 
     def _refresh_system_info(self) -> None:
         res = compute_system_resources()
+        icon_cpu = self._get_ui_icon("memory", color="#38bdf8", size=15)
+        extra = {"image": icon_cpu, "compound": LEFT} if icon_cpu else {}
         self.sys_label.configure(
             text=(
-                f"💻 CPU: {res['threads']} thread ({res['cores']} core)   ·   "
-                f"🧠 RAM disp.: {res['ram_avail']}/{res['ram_tot']} GB   ·   "
-                f"⚡ Worker: {res['max_workers']}   ·   "
-                f"🎛️ Preset: {res['preset']}"
-            )
+                f" CPU: {res['threads']} thread ({res['cores']} core)   ·   "
+                f"RAM disp.: {res['ram_avail']}/{res['ram_tot']} GB   ·   "
+                f"Worker: {res['max_workers']}   ·   "
+                f"Preset: {res['preset']}"
+            ),
+            **extra,
         )
 
     def _open_folder(self, sub: str) -> None:
