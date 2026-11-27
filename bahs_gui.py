@@ -165,7 +165,7 @@ class BahsGuiApp(BaseWindow):
 
         self.title("BAHS · Basketball Highlights Automation Suite")
         self.geometry("1120x860")
-        self.minsize(1000, 760)
+        self.minsize(720, 480)
 
         self.base_dir_var = tk.StringVar(value=str(Path(__file__).resolve().parent))
         self.tipo_var = tk.StringVar(value=DEFAULT_TOP_TEXT)
@@ -748,8 +748,59 @@ class BahsGuiApp(BaseWindow):
             self._extra_logo_img = None
             self.logo_preview_lbl.configure(image="", text="Logo err", width=16, height=4)
 
+    def _build_scrollable_container(self, parent: ttk.Frame) -> ttk.Frame:
+        panel_bg = self._get_panel_bg(parent)
+        wrapper = ttk.Frame(parent)
+        wrapper.pack(fill=BOTH, expand=True)
+
+        canvas = tk.Canvas(wrapper, bg=panel_bg, highlightthickness=0, bd=0)
+        v_scroll = ttk.Scrollbar(wrapper, orient=tk.VERTICAL, command=canvas.yview)
+        h_scroll = ttk.Scrollbar(wrapper, orient=tk.HORIZONTAL, command=canvas.xview)
+        canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky=NS)
+        h_scroll.grid(row=1, column=0, sticky=EW)
+        wrapper.rowconfigure(0, weight=1)
+        wrapper.columnconfigure(0, weight=1)
+
+        inner = ttk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            req_w = inner.winfo_reqwidth()
+            canvas.itemconfigure(win_id, width=max(event.width, req_w))
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            if event.state & 0x0001:  # Shift per scroll orizzontale
+                delta = -1 if event.delta > 0 else 1
+                canvas.xview_scroll(delta, "units")
+            else:
+                delta = -1 if event.delta > 0 else 1
+                canvas.yview_scroll(delta, "units")
+
+        def _bind_wheel(_e):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        def _unbind_wheel(_e):
+            canvas.unbind_all("<MouseWheel>")
+
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+        inner.bind("<Enter>", _bind_wheel)
+        inner.bind("<Leave>", _unbind_wheel)
+
+        return inner
+
     def _build_ui(self) -> None:
-        main_pad = ttk.Frame(self, padding=14)
+        root_scroll = self._build_scrollable_container(self)
+        main_pad = ttk.Frame(root_scroll, padding=14)
         main_pad.pack(fill=BOTH, expand=True)
 
         # --- Cartella Progetto, Risorse & Logo EXTRA a destra ---
@@ -880,7 +931,7 @@ class BahsGuiApp(BaseWindow):
 
         self.log_text = tk.Text(
             log_box,
-            height=9,
+            height=11,
             wrap=tk.NONE,
             font=("Consolas", 9),
             bg=bg_log,
