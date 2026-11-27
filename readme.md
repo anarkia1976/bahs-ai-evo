@@ -1,6 +1,6 @@
 # 🏀 BAHS — Basketball Automation Highlights Suite
 
-**BAHS** è una suite modulare di script Python progettata per automatizzare l'intera produzione di video di pallacanestro (*Highlights*, *Gameday*, *Friendly Match* e formati *Custom*) a partire dai filmati sorgente inseriti nella cartella `IN/`.
+**BAHS** è una suite modulare di script Python progettata per automatizzare l'intera produzione di video di pallacanestro (*Highlights*, *Gameday*, *Friendly Match* e formati *Custom*) a partire dai filmati sorgente inseriti nella cartella `IN/`, affiancata dall'interfaccia grafica desktop **`bahs_gui.py`**.
 
 La pipeline gestisce in automatico la preparazione o l'unione dei video originali, l'identificazione interattiva dei timestamp, il taglio parallelo delle clip, la conversione verticale in formato **REEL (9:16)** con tracciamento della palla tramite **YOLO** e invio diretto via pipe a **FFmpeg**, la normalizzazione parallela e fusione con dissolvenze incrociate (`xfade`/`acrossfade`), l'aggiunta della traccia musicale con fade-out finale e la sovraimpressione combinata di testi animati e logo in un singolo passaggio. Le logiche comuni, la gestione risorse/GPU, i percorsi, il logging e le utilità sui file sono centralizzati in **`bahs_core.py`**.
 
@@ -20,7 +20,8 @@ BAHS/
 │   └── 📂 MODEL/                          # 🤖 Pesi del modello YOLO (es. yolo26l.pt)
 │
 ├── 🧩 bahs_core.py                        # 🛠️ Modulo condiviso (risorse CPU/RAM/GPU, percorsi, log, nomi, timestamp)
-├── 🚀 01_BAHS_main-ALL.py                 # 🚀 Orchestratore principale (controlli, pulizia, parametri e pipeline)
+├── 🖥️ bahs_gui.py                         # 🖥️ Interfaccia grafica desktop (pipeline, parametri, risorse, log live)
+├── 🚀 01_BAHS_main-ALL.py                 # 🚀 Orchestratore CLI principale (controlli, pulizia, parametri e pipeline)
 ├── 🔗 02_BAHS_merge-originals-ALL.py      # 🔗 Copia o remux/concatenazione dei video originali da IN/ a OUT/
 ├── ⏱️ 03_BAHS_identify-timestamps-ALL.py  # ⏱️ Player interattivo OpenCV per la registrazione dei timestamp
 ├── ✂️ 04_BAHS_split-original-ALL.py       # ✂️ Taglio parallelo delle clip dal video unito in base ai timestamp
@@ -49,13 +50,16 @@ Gli script verificano e creano automaticamente tutte le cartelle necessarie all'
 
 ---
 
-## 🧩 Scopo dei singoli script
+## 🧩 Scopo dei singoli script e dell'interfaccia grafica
 
 ### 🧩 Modulo condiviso
 * **`bahs_core.py`**: fornisce l'infrastruttura comune a tutta la suite, evitando duplicazioni tra orchestratore e step operativi (gestione console ANSI e QuickEdit su Windows, stima RAM/CPU/worker, rilevamento dispositivi CUDA e encoder `h264_nvenc` / `h264_amf` / `libx264`, creazione cartelle, logging per singolo step, lettura/sincronizzazione timestamp e rimozione file temporanei).
 
-### 🚀 Orchestratore
-* **`01_BAHS_main-ALL.py`**: punto di ingresso principale della suite. Verifica le cartelle, controlla `ffmpeg`/`ffprobe` e i pacchetti richiesti (`requirements.txt`), attende i video in `IN/`, propone la pulizia delle cartelle di lavoro (`OUT`, `FINAL`, `TMP` e vecchi log preservando `IN`, `EXTRA` e `MUSIC`), acquisisce i parametri dell'incontro e avvia in sequenza tutti gli step previsti. Se `04_BAHS_split-original-ALL.py` fallisce per mancanza di timestamp, propone di avviare `03_BAHS_identify-timestamps-ALL.py` e riprovare il taglio.
+### 🖥️ Interfaccia grafica desktop
+* **`bahs_gui.py`**: interfaccia grafica basata su `ttkbootstrap` (con fallback `tkinter` standard) e `tkinter-icons` (`MaterialIcon` di default, con fallback `Pillow`) per gestire il progetto e la pipeline senza riga di comando. Include selezione della cartella base e creazione cartelle, anteprima del logo in `EXTRA/`, caricamento/pulizia video in `IN/`, esecuzione completa o del singolo step con indicatore di stato e avanzamento step, console di output live, scheda **Parametri Avanzati** (`03`, `04`, `05`, `06`, `11`) e scheda **Risorse Personalizzate** per installare logo (con backup in `EXTRA/BACKUP/`), font e musica.
+
+### 🚀 Orchestratore CLI
+* **`01_BAHS_main-ALL.py`**: punto di ingresso principale da terminale. Verifica le cartelle, controlla `ffmpeg`/`ffprobe` e i pacchetti richiesti (`requirements.txt`), attende i video in `IN/`, propone la pulizia delle cartelle di lavoro (`OUT`, `FINAL`, `TMP` e vecchi log preservando `IN`, `EXTRA` e `MUSIC`), acquisisce i parametri dell'incontro e avvia in sequenza tutti gli step previsti. Se `04_BAHS_split-original-ALL.py` fallisce per mancanza di timestamp, propone di avviare `03_BAHS_identify-timestamps-ALL.py` e riprovare il taglio.
 
 ### 🎬 Moduli della pipeline
 * 🔗 **`02_BAHS_merge-originals-ALL.py`**: copia direttamente un singolo `.mp4` da `IN/`, oppure esegue il remux / concatenazione (`-c copy` con `+faststart`) in `OUT/{TIPO}_{FORMATO}_merged_orig.mp4`.
@@ -81,7 +85,15 @@ Gli script verificano e creano automaticamente tutte le cartelle necessarie all'
 
 ## 🛠️ Guida all'utilizzo
 
-### 1️⃣ Avvio completo tramite Orchestratore (Consigliato)
+### 0️⃣ Avvio tramite Interfaccia Grafica (`bahs_gui.py`)
+1. Assicurati di aver installato le dipendenze (incluso `tkinter-icons[material]`).
+2. Avvia la GUI da terminale:
+   ```bash
+   python bahs_gui.py
+   ```
+3. Imposta la cartella base, carica i video in `IN/`, gestisci eventuali risorse personalizzate nella scheda **Risorse Personalizzate** (logo, font, musica) o regola i parametri nella scheda **Parametri Avanzati**, quindi avvia la pipeline completa o un singolo step.
+
+### 1️⃣ Avvio completo tramite Orchestratore CLI (Consigliato da terminale)
 1. Copia uno o più video della partita nella cartella **`IN/`**.
 2. Inserisci eventuali brani in **`MUSIC/`** (se usi `HIGHLIGHTS` o `CUSTOM`) e il logo (`logo.*`) in **`EXTRA/`** (più `font.ttf` in `EXTRA/`).
 3. Avvia lo script principale da terminale:
@@ -131,5 +143,5 @@ Ogni modulo può essere avviato anche singolarmente da riga di comando:
 
 ## ⚙️ Requisiti di sistema
 
-* 🐍 **Python 3.10+** con le librerie installate tramite `pip install -r requirements.txt` (`opencv-python`, `tqdm`, `ultralytics`, `torch`, `psutil`).
+* 🐍 **Python 3.10+** con le librerie installate tramite `pip install -r requirements.txt` (`opencv-python`, `tqdm`, `ultralytics`, `torch`, `psutil`, `ttkbootstrap`, `tkinter-icons[material]`).
 * 🎥 **FFmpeg & FFprobe** installati e configurati nella variabile d'ambiente `PATH` (con eventuale supporto encoder hardware `h264_nvenc` / `h264_amf` e GPU CUDA per `ultralytics`).
