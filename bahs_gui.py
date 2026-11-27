@@ -483,18 +483,25 @@ class BahsGuiApp(BaseWindow):
         videos = self._list_in_videos(root)
         if not hasattr(self, "in_status_lbl"):
             return
-        if videos:
-            names = ", ".join(p.name for p in videos[:3])
-            extra = f" (+{len(videos) - 3})" if len(videos) > 3 else ""
+        count = len(videos)
+        if count > 0:
+            voce = "video pronto e disponibile" if count == 1 else "video pronti e disponibili"
             self.in_status_lbl.configure(
-                text=f"🎬 Cartella IN/: {len(videos)} video pronti ({names}{extra})"
+                text=f"🎬 Cartella IN: {count} {voce}"
             )
         else:
             self.in_status_lbl.configure(
-                text="⚠️ Cartella IN/: nessun file video presente"
+                text="⚠️ Cartella IN: 0 video pronti e disponibili"
             )
 
     def _upload_videos_to_in(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning(
+                "Elaborazione in corso",
+                "Attendi o interrompi l'esecuzione corrente prima di caricare video in IN/.",
+            )
+            return
+
         root = Path(self.base_dir_var.get().strip() or ".").resolve()
         ensure_project_dirs(root, include_model_dir=True)
         in_dir = root / "IN"
@@ -508,18 +515,41 @@ class BahsGuiApp(BaseWindow):
         if not chosen:
             return
 
-        copied: list[str] = []
-        for src_str in chosen:
-            src = Path(src_str)
-            if not src.is_file():
-                continue
-            dest = in_dir / src.name
-            shutil.copy2(str(src), str(dest))
-            copied.append(dest.name)
+        files_to_copy = [Path(src_str) for src_str in chosen if Path(src_str).is_file()]
+        if not files_to_copy:
+            return
 
+        self.btn_run_all.configure(state=DISABLED)
+        self._set_status_state("in_corso")
+        self.worker_thread = threading.Thread(
+            target=self._copy_videos_worker,
+            args=(in_dir, files_to_copy),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _copy_videos_worker(self, in_dir: Path, files_to_copy: list[Path]) -> None:
+        copied: list[str] = []
+        has_error = False
+        try:
+            for src in files_to_copy:
+                dest = in_dir / src.name
+                self._append_log(f"[IN] Copia in corso: {src.name}...\n")
+                shutil.copy2(str(src), str(dest))
+                copied.append(dest.name)
+        except Exception as exc:
+            has_error = True
+            self._append_log(f"[IN][ERRORE] Copia video fallita: {exc}\n")
+        finally:
+            if copied:
+                self._append_log(f"[IN] Caricati in IN/: {', '.join(copied)}\n")
+            next_state = "errore" if has_error else "pronto"
+            self._set_status_from_worker(next_state)
+            self.after(0, self._on_upload_finished)
+
+    def _on_upload_finished(self) -> None:
+        self.btn_run_all.configure(state=NORMAL)
         self._refresh_in_videos_status()
-        if copied:
-            self._append_log(f"[IN] Caricati in IN/: {', '.join(copied)}\n")
 
     def _clear_in_folder(self) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
@@ -783,6 +813,8 @@ class BahsGuiApp(BaseWindow):
         canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
 
         canvas.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky=NS)
+        h_scroll.grid(row=1, column=0, sticky=EW)
         wrapper.rowconfigure(0, weight=1)
         wrapper.columnconfigure(0, weight=1)
 
@@ -886,7 +918,7 @@ class BahsGuiApp(BaseWindow):
 
         row_in = ttk.Frame(left_info)
         row_in.pack(fill=X, pady=(6, 0))
-        self.in_status_lbl = ttk.Label(row_in, text="🎬 Cartella IN/: -")
+        self.in_status_lbl = ttk.Label(row_in, text="🎬 Cartella IN: -")
         self.in_status_lbl.pack(side=LEFT, fill=X, expand=True)
         self._btn(row_in, "Carica Video in IN...", self._upload_videos_to_in, bootstyle="success-outline").pack(side=LEFT, padx=(0, 6))
         self._btn(row_in, "Pulisci IN/", self._clear_in_folder, bootstyle="danger-outline").pack(side=LEFT, padx=(0, 6))
