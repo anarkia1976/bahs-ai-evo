@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import math
 import queue
 import shutil
@@ -212,6 +213,10 @@ class BahsGuiApp(BaseWindow):
         self._window_icon_img: tk.PhotoImage | None = None
         self._extra_logo_img: tk.PhotoImage | None = None
 
+        # Carica eventuali parametri custom salvati in precedenza
+        self._load_settings()
+        self.protocol("WM_DELETE_WINDOW", self._on_close_save_settings)
+
         self._set_basketball_window_icon()
         self._build_ui()
         self._set_status_state("pronto")
@@ -222,6 +227,88 @@ class BahsGuiApp(BaseWindow):
         self._refresh_extra_assets_status()
         self._poll_log_queue()
         self._apply_windows_dark_titlebar()
+
+    def _settings_file_path(self) -> Path:
+        root_str = self.base_dir_var.get().strip() if hasattr(self, "base_dir_var") else ""
+        root = Path(root_str or Path(__file__).resolve().parent).resolve()
+        return root / "EXTRA" / "gui_settings.json"
+
+    def _collect_settings_dict(self) -> dict:
+        return {
+            "base_dir": self.base_dir_var.get().strip(),
+            "tipo": self.tipo_var.get(),
+            "tipo_custom": self.tipo_custom_var.get(),
+            "sottotitolo": self.sottotitolo_var.get(),
+            "formato": self.formato_var.get(),
+            "ts_speed": self.ts_speed_var.get(),
+            "before": self.before_var.get(),
+            "after": self.after_var.get(),
+            "model": self.model_var.get(),
+            "device": self.device_var.get(),
+            "conf": self.conf_var.get(),
+            "alpha": self.alpha_var.get(),
+            "gap": self.gap_var.get(),
+            "imgsz": self.imgsz_var.get(),
+            "no_fade": bool(self.no_fade_var.get()),
+            "duration": self.duration_var.get(),
+        }
+
+    def _save_settings(self) -> None:
+        try:
+            cfg_path = self._settings_file_path()
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            data = self._collect_settings_dict()
+            cfg_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            self._append_log(f"[GUI][WARN] Impossibile salvare impostazioni: {exc}\n")
+
+    def _load_settings(self) -> None:
+        cfg_path = self._settings_file_path()
+        if not cfg_path.is_file():
+            return
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+
+            if "base_dir" in data and data["base_dir"]:
+                self.base_dir_var.set(str(data["base_dir"]))
+            if "tipo" in data:
+                self.tipo_var.set(str(data["tipo"]))
+            if "tipo_custom" in data:
+                self.tipo_custom_var.set(str(data["tipo_custom"]))
+            if "sottotitolo" in data:
+                self.sottotitolo_var.set(str(data["sottotitolo"]))
+            if "formato" in data:
+                self.formato_var.set(str(data["formato"]))
+            if "ts_speed" in data:
+                self.ts_speed_var.set(str(data["ts_speed"]))
+            if "before" in data:
+                self.before_var.set(str(data["before"]))
+            if "after" in data:
+                self.after_var.set(str(data["after"]))
+            if "model" in data:
+                self.model_var.set(str(data["model"]))
+            if "device" in data:
+                self.device_var.set(str(data["device"]))
+            if "conf" in data:
+                self.conf_var.set(str(data["conf"]))
+            if "alpha" in data:
+                self.alpha_var.set(str(data["alpha"]))
+            if "gap" in data:
+                self.gap_var.set(str(data["gap"]))
+            if "imgsz" in data:
+                self.imgsz_var.set(str(data["imgsz"]))
+            if "no_fade" in data:
+                self.no_fade_var.set(bool(data["no_fade"]))
+            if "duration" in data:
+                self.duration_var.set(str(data["duration"]))
+        except Exception as exc:
+            self._append_log(f"[GUI][WARN] Impossibile caricare impostazioni: {exc}\n")
+
+    def _on_close_save_settings(self) -> None:
+        self._save_settings()
+        self.destroy()
 
     def _get_ui_icon(
         self,
@@ -1461,10 +1548,12 @@ class BahsGuiApp(BaseWindow):
         tipo = self.tipo_var.get()
         is_highlights = tipo == "HIGHLIGHTS"
 
-        self.tipo_custom_var.set(tipo)
         if tipo == "CUSTOM":
             self.custom_entry.configure(state=NORMAL)
+            if not self.tipo_custom_var.get().strip():
+                self.tipo_custom_var.set(DEFAULT_TOP_TEXT)
         else:
+            self.tipo_custom_var.set(tipo)
             self.custom_entry.configure(state=DISABLED)
 
         if is_highlights:
@@ -1490,6 +1579,8 @@ class BahsGuiApp(BaseWindow):
         chosen = filedialog.askdirectory(initialdir=self.base_dir_var.get() or ".")
         if chosen:
             self.base_dir_var.set(chosen)
+            self._load_settings()
+            self._on_tipo_changed()
             self._refresh_system_info()
             self._refresh_in_videos_status()
             self._refresh_extra_logo()
@@ -1707,6 +1798,7 @@ class BahsGuiApp(BaseWindow):
             messagebox.showwarning("Elaborazione in corso", "Attendi o interrompi l'esecuzione corrente prima di avviare un nuovo comando.")
             return
 
+        self._save_settings()
         base_dir = Path(self.base_dir_var.get().strip() or ".").resolve()
         ensure_project_dirs(base_dir, include_model_dir=True)
 
