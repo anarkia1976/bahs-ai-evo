@@ -212,9 +212,11 @@ class BahsGuiApp(BaseWindow):
 
         self._window_icon_img: tk.PhotoImage | None = None
         self._extra_logo_img: tk.PhotoImage | None = None
+        self._last_normal_geometry: str = "1120x860"
 
-        # Carica eventuali parametri custom salvati in precedenza
+        # Carica eventuali parametri e dimensione finestra salvati in precedenza
         self._load_settings()
+        self.bind("<Configure>", self._on_window_configure)
         self.protocol("WM_DELETE_WINDOW", self._on_close_save_settings)
 
         self._set_basketball_window_icon()
@@ -228,14 +230,35 @@ class BahsGuiApp(BaseWindow):
         self._poll_log_queue()
         self._apply_windows_dark_titlebar()
 
+    def _on_window_configure(self, event) -> None:
+        if event.widget is self:
+            try:
+                if self.state() == "normal":
+                    self._last_normal_geometry = self.geometry()
+            except Exception:
+                pass
+
     def _settings_file_path(self) -> Path:
         root_str = self.base_dir_var.get().strip() if hasattr(self, "base_dir_var") else ""
         root = Path(root_str or Path(__file__).resolve().parent).resolve()
         return root / "EXTRA" / "gui_settings.json"
 
     def _collect_settings_dict(self) -> dict:
+        try:
+            win_state = self.state()
+        except Exception:
+            win_state = "normal"
+
+        if win_state == "normal":
+            try:
+                self._last_normal_geometry = self.geometry()
+            except Exception:
+                pass
+
         return {
             "base_dir": self.base_dir_var.get().strip(),
+            "window_geometry": self._last_normal_geometry,
+            "window_state": win_state,
             "tipo": self.tipo_var.get(),
             "tipo_custom": self.tipo_custom_var.get(),
             "sottotitolo": self.sottotitolo_var.get(),
@@ -262,6 +285,41 @@ class BahsGuiApp(BaseWindow):
         except Exception as exc:
             self._append_log(f"[GUI][WARN] Impossibile salvare impostazioni: {exc}\n")
 
+    def _apply_saved_window_geometry(self, geom: str, win_state: str = "normal") -> None:
+        if not geom:
+            return
+        try:
+            size_part = geom.split("+", 1)[0]
+            w_str, h_str = size_part.lower().split("x", 1)
+            w_val = max(720, int(w_str))
+            h_val = max(480, int(h_str))
+            rest = geom[len(size_part):]
+
+            # Evita che la finestra finisca fuori schermo se il monitor è cambiato
+            if rest.startswith("+"):
+                coords = rest[1:].split("+")
+                if len(coords) == 2:
+                    x_val = int(coords[0])
+                    y_val = int(coords[1])
+                    scr_w = self.winfo_screenwidth()
+                    scr_h = self.winfo_screenheight()
+                    if 0 <= x_val < scr_w - 100 and 0 <= y_val < scr_h - 100:
+                        sanitized = f"{w_val}x{h_val}+{x_val}+{y_val}"
+                    else:
+                        sanitized = f"{w_val}x{h_val}"
+                else:
+                    sanitized = f"{w_val}x{h_val}"
+            else:
+                sanitized = f"{w_val}x{h_val}"
+
+            self._last_normal_geometry = sanitized
+            self.geometry(sanitized)
+
+            if win_state == "zoomed":
+                self.after(50, lambda: self.state("zoomed"))
+        except Exception:
+            pass
+
     def _load_settings(self) -> None:
         cfg_path = self._settings_file_path()
         if not cfg_path.is_file():
@@ -273,6 +331,11 @@ class BahsGuiApp(BaseWindow):
 
             if "base_dir" in data and data["base_dir"]:
                 self.base_dir_var.set(str(data["base_dir"]))
+            if "window_geometry" in data and data["window_geometry"]:
+                self._apply_saved_window_geometry(
+                    str(data["window_geometry"]),
+                    str(data.get("window_state", "normal")),
+                )
             if "tipo" in data:
                 self.tipo_var.set(str(data["tipo"]))
             if "tipo_custom" in data:
